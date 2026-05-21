@@ -50,17 +50,6 @@ Slack #<SLACK_CHANNEL_ID>
 
 ---
 
-## 1. vs 原博客的优化
-
-| # | 项 | 原博客 | 本文档 |
-|---|---|---|---|
-| 1 | description 写法 | 硬编码 `EC2 Instance: {id}` | 通用化：自动提取 namespace + 全部 dimensions（EC2/EKS/RDS/Lambda 共用一份 Lambda） |
-| 2 | Starting point 表达 | 混在描述里 | 显式分段为 `Investigation starting point` + `Investigation details` |
-| 3 | 通知渠道 | 飞书（App ID/Secret/Tenant Token） | Slack Incoming Webhook（复用 petsite-ops-slack-notifier 的现成 webhook） |
-| 4 | 配置存储 | 写死在脚本里 | `.env` 文件 + `.env.example` 模板（`.gitignore` 排除真实 .env） |
-| 5 | Rule-1 alarm 范围 | 硬编码单个 alarm 名 | `state.value=ALARM` 全匹配；任何告警进 ALARM 都触发调查 |
-| 6 | Chat 模式 | 只演示了基本 send_message | 做了完整 CLI（`scripts/chat.sh`）支持 one-shot / REPL / `--resume` / `--show-thinking` |
-
 ---
 
 ## 2. 前置条件
@@ -515,72 +504,9 @@ print(json.dumps(r['tasks'][:5], default=str, indent=2))
 4. *Bug found & fixed*：原 Lambda-A 从 `event['detail'].get('accountId')` 读 account ID，但 EventBridge 事件结构里 `account` 和 `region` 是 *top-level 字段*。已改成 `event.get('account')` / `event.get('region')`
 
 ---
-
-## 7. 五维权衡（PSA + PA 双视角）
-
-| 维度 | 评估 | 备注 |
-|---|---|---|
-| 可维护性 | ✅ | 1 份 Lambda 适配所有告警源；`.env` 集中管理；description 模板单点修改 |
-| 可测试性 | ⚠️ | 没有单元测试；`_format_description` / `_build_title` / `_chunk_for_slack` 是纯函数好测 |
-| 可部署性 | ✅ | 单脚本一键部署，幂等；提供 cleanup.sh、add-node-loss-alarms.sh、run-fis-2node-termination.sh |
-| 可扩展性 | ✅ | EventBridge fanout，将来加飞书/钉钉/企业微信 Lambda 不影响主链路 |
-| 可用性 | ⚠️ | Slack webhook 挂了消息丢；建议加 DLQ + retry |
-
-### PSA 视角
-
-- ✅ 用 EventBridge 解耦，Well-Architected 松耦合
-- ✅ IAM 最小权限到 `aidevops:` 具体 action
-- ✅ 复用账号现有 webhook，不增加新的 secret 攻击面
-- ⚠️ Rule-1 全 ALARM 匹配，告警量大的账号可能成本失控（DevOps Agent triage 阶段会做 20 分钟 correlation 自动 LINK 类似告警，缓解但不消除）
-- ⚠️ Webhook URL 在 Lambda env var 明文存储，CloudTrail 可见。生产环境改 Secrets Manager
-- ⚠️ Agent 单次问答可触发 *30+ tool calls*（跨 region 扫描），token/调用成本可观
-
-### PA 视角
-
-- ✅ 部署脚本 + .env 模式标准化，团队 5 分钟读懂
-- ✅ 不绑死特定 service（EC2 / EKS / RDS / Lambda 都能用），未来加监控不用改代码
-- ✅ 端到端验证脚本现成，每次环境变更可复跑
-- ⚠️ Webhook 泄露需要在 Slack App 设置里 *revoke + regenerate*，新 URL 同步到 .env 重新部署
-- ❓ 成本：DevOps Agent preview 期定价不公开，建议用 `get_account_usage` API 监控调查计费
-
 ---
 
-## 8. 进阶建议（按优先级）
-
-### P0（生产前必做）
-
-1. *Slack 推送加 DLQ*（**已落地** P0-5；deploy.sh 会自动建 `devops-agent-notify-dlq`）
-   ```bash
-   # 历史人工命令（保留作为 reference；当前由 deploy.sh 自动跑）
-   aws sqs create-queue --region "${AWS_REGION}" --queue-name devops-agent-notify-dlq
-   aws lambda update-function-configuration \
-     --function-name devops-agent-notify-slack \
-     --dead-letter-config "TargetArn=arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:devops-agent-notify-dlq"
-   ```
-2. *Rule-1 加 alarm 名 prefix filter*：
-   ```json
-   "detail": {
-     "state": { "value": ["ALARM"] },
-     "alarmName": [{ "prefix": "petsite-" }]
-   }
-   ```
-3. *Webhook URL 挪到 Secrets Manager*，Lambda 运行时拉
-
-### P1（建议）
-
-4. *补单元测试* — Lambda-A 的 `_format_description` / `_build_title` / `_chunk_for_slack` 是纯函数，pytest 几行就能覆盖
-5. *Failed / Cancelled 事件也通知* — 当前只处理 COMPLETED
-6. *加 CloudWatch Dashboard* — Lambda invocation count / Slack POST 失败率 / DevOps Agent 调查耗时
-7. *DevOps Agent Skill / KnowledgeItem* — triage 阶段挂自定义 correlation 规则
-
-### P2
-
-8. *改 IaC*（CDK / Terraform）
-9. *Agent 服务角色加 tag-based scope* — 用 `aws:ResourceTag/Project=petsite` 替代 region deny，让 Agent 只看 PetSite 资源（详见 §5.3 提到的官方文档）
-
----
-
-## 9. 清理
+## 8. 清理
 
 ```bash
 ./scripts/cleanup.sh           # 主链路（IAM role / Lambda-A&B / 两个 EventBridge 规则）

@@ -2,18 +2,20 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   [Step 2 / Global Account / e.g. us-east-1]
   MCP bridge that lets the AWS DevOps Agent (Global partition only) operate
-  on China-region (aws-cn) resources via IAM Roles Anywhere with full
-  AdministratorAccess.
+  on China-region (aws-cn) resources via IAM Roles Anywhere with the
+  managed policy attached to the China-side role (default: ReadOnlyAccess).
 
   Architecture: DevOps Agent -> CloudFront (HTTPS) -> ALB (HTTP, header
   auth, ingress restricted to CloudFront origin-facing prefix list) ->
   EC2 running awslabs.aws-api-mcp-server -> aws_signing_helper -> IAM Roles
   Anywhere (China partition) -> aws-cn APIs.
 
-  WARNING: the China role attached has AdministratorAccess. Possession of
-  the X-API-Key + reachability of CloudFront = full control of the China
-  account during credential validity. Lock down AllowedAdminCidrs and
-  rotate the API key after any incident.
+  WARNING: the effective scope of access depends on the managed policy you
+  attached in Step 1 (ManagedPolicyArn parameter). If you widened it beyond
+  the default ReadOnlyAccess, possession of the X-API-Key + reachability of
+  CloudFront = that level of control of the China account during credential
+  validity. Lock down AllowedAdminCidrs and rotate the API key after any
+  incident.
 
   Prerequisites:
     1. Deploy 01-cn-roles-anywhere.yaml in the China account first.

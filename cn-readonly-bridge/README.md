@@ -1,17 +1,21 @@
-# DevOps Agent 中国区桥接（CFN 通用模板，AdministratorAccess）
+# DevOps Agent 中国区桥接（CFN 通用模板，默认 ReadOnlyAccess）
 
-让 **Global 分区** 的 AWS DevOps Agent（仅在 us-east-1/us-west-2 等可用，不支持 aws-cn）能**全权限操作**中国区（cn-northwest-1 / cn-north-1）资源。
+让 **Global 分区** 的 AWS DevOps Agent（仅在 us-east-1/us-west-2 等可用，不支持 aws-cn）能**只读访问**中国区（cn-northwest-1 / cn-north-1）资源。如需写权限，部署时传 `ManagedPolicyArn=...PowerUserAccess` 或 `...AdministratorAccess` 显式 opt-in。
 
-> 本模板从 workshop 项目 [`operating-china-region-using-devops-agent`](../../operating-china-region-using-devops-agent) 提炼而来，**去除 Workshop Studio 强依赖**（不再从 assets bucket 拉 cert），改成 SSM Parameter Store 输入；ALB SG 接 CloudFront origin-facing prefix list；IAM Role 默认 `AdministratorAccess`；MCP server 默认 `@latest`。
+> 本模板从 workshop 项目 [`operating-china-region-using-devops-agent`](../../operating-china-region-using-devops-agent) 提炼而来，**去除 Workshop Studio 强依赖**（不再从 assets bucket 拉 cert），改成 SSM Parameter Store 输入；ALB SG 接 CloudFront origin-facing prefix list；IAM Role 默认 `ReadOnlyAccess`；MCP server 默认 `@latest`。
 
-## ⚠️ 安全警告
+## ⚠️ 安全说明
 
-当前是 **全权限模式**：
-- 中国 IAM Role 挂 `AdministratorAccess`（可创建/删除/修改中国账号内任何资源）
-- MCP server 不再设 `READ_OPERATIONS_ONLY`
-- 任何拿到 *X-API-Key + CloudFront 域名* 的人都能调中国 API 干任何事
+当前是 **只读模式（默认）**：
+- 中国 IAM Role 默认挂 `ReadOnlyAccess`（只能列出 / 描述资源，不能创建 / 修改 / 删除）
+- MCP server 未设 `READ_OPERATIONS_ONLY`（这是 profile name `china-readonly` + IAM 只读 policy 双重限制）
+- 任何拿到 *X-API-Key + CloudFront 域名* 的人只能读中国账号信息（包括资源拓扑、IAM 配置、实例信息等）
 
-请确保：
+**如果你主动 opt-in 扩大权限**（`ManagedPolicyArn=...AdministratorAccess`）：
+- 中国 IAM Role 能干账号内任何事（创建 / 删除 / 修改）
+- 拿到 *X-API-Key + CloudFront 域名* 的人 = 中国账号完全控制权
+
+无论哪种模式，请确保：
 1. SecretsManager 里的 API Key **只发给必要的人**，泄漏后立即 update-stack 旋转
 2. client.crt/key 在本地 + SSM SecureString 严妥保管，泄漏后立即删 Trust Anchor 重建
 3. CloudWatch / CloudTrail 开启中国账号审计，跟踪 `devops-agent-cn-admin-role` 的所有调用
@@ -29,7 +33,7 @@ CloudFront ──► ALB(:80, Header 校验, SG=CloudFront prefix list) ──�
                                                                         ▼
                                                           aws_signing_helper ──► IAM Roles Anywhere
                                                           (X.509 client cert)    (cn-northwest-1)
-                                                                        │ 1h 临时凭证 (Admin)
+                                                                        │ 1h 临时凭证 (ReadOnly default)
                                                                         ▼
                                                                   aws-cn API
 ```
@@ -40,7 +44,7 @@ CloudFront ──► ALB(:80, Header 校验, SG=CloudFront prefix list) ──�
 
 | 文件 | 部署位置 | 作用 |
 |------|---------|------|
-| `01-cn-roles-anywhere.yaml` | **中国账号 / cn-northwest-1** | Trust Anchor + Profile + Admin IAM Role |
+| `01-cn-roles-anywhere.yaml` | **中国账号 / cn-northwest-1** | Trust Anchor + Profile + Read-Only IAM Role（可 opt-in 到 Admin）|
 | `02-global-mcp-bridge.yaml` | **Global 账号 / us-east-1** | VPC + ALB(prefix list) + CloudFront + EC2(MCP server) |
 
 ---
@@ -90,7 +94,7 @@ aws cloudformation describe-stacks \
 
 会拿到 `TrustAnchorArn` / `ProfileArn` / `RoleArn`。
 
-> 想收紧权限？用 `--parameter-overrides` 加 `ManagedPolicyArn=arn:aws-cn:iam::aws:policy/PowerUserAccess` 或你自己的 managed policy ARN。
+> 想收紧权限？默认已是 `ReadOnlyAccess`，无需额外参数。需要写权限才传 `--parameter-overrides ManagedPolicyArn=arn:aws-cn:iam::aws:policy/PowerUserAccess`（或 AdministratorAccess / 你自己的 managed policy ARN）。
 
 ### Step 2：把 client cert/key 上传到 Global 账号 SSM Parameter Store
 
@@ -214,9 +218,9 @@ ALB ListenerRule 用 `{{resolve:secretsmanager:...}}` 引用 API Key，是 **CFN
 | cert/params 来源 | S3 assets bucket | SSM Parameter Store SecureString |
 | MCP server 版本 | `awslabs...@latest` | 参数化（默认 `latest`，可钉版） |
 | `AWS_API_MCP_ALLOWED_HOSTS` | `*` | ALB DNS（防 Host header 攻击） |
-| `READ_OPERATIONS_ONLY` | `true` | 不设置（全权限） |
+| `READ_OPERATIONS_ONLY` | `true` | 不设置（依赖 IAM `ReadOnlyAccess` 限制） |
 | ALB SG ingress | DevOps Agent IP/32 + `0.0.0.0/0` | CloudFront origin-facing prefix list + 可选 admin CIDR |
-| China Role policy | `ReadOnlyAccess` | `AdministratorAccess`（可参数覆盖） |
+| China Role policy | `ReadOnlyAccess` | `ReadOnlyAccess`（默认；可参数覆盖为 PowerUser / Admin） |
 | CloudFront | 必选 | 可选（`EnableCloudFront`） |
 | Roles Anywhere session | 固定 3600s | 参数化 |
 | 中国 sample resources | 模板内含 | 不包含 |

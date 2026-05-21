@@ -1,13 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   [Step 1 / China Account / cn-northwest-1 or cn-north-1]
-  IAM Roles Anywhere Trust Anchor + Profile + Admin Role for the
+  IAM Roles Anywhere Trust Anchor + Profile + Read-Only Role for the
   Global-region DevOps Agent MCP bridge to obtain short-lived credentials
   in the China partition.
 
-  WARNING: this role grants AdministratorAccess. Anyone in possession of
-  the client cert/key can perform ANY action in the China account during
-  the credential validity window. Treat the cert as a root credential.
+  Default policy is ReadOnlyAccess. Anyone in possession of the client
+  cert/key can read ANY resource metadata in the China account during
+  the credential validity window. To enable write operations, override
+  ManagedPolicyArn at deploy time (e.g. to PowerUserAccess or
+  AdministratorAccess) AT YOUR OWN RISK and rotate the cert as a root
+  credential.
 
   Deploy ONCE in the China account. Outputs (TrustAnchorArn / ProfileArn /
   RoleArn) feed into the Global-region bridge stack.
@@ -37,11 +40,13 @@ Parameters:
 
   ManagedPolicyArn:
     Type: String
-    Default: 'arn:aws-cn:iam::aws:policy/AdministratorAccess'
+    Default: 'arn:aws-cn:iam::aws:policy/ReadOnlyAccess'
     Description: >
-      Managed policy ARN attached to the role. Defaults to AdministratorAccess.
-      Override to a tighter policy (e.g. PowerUserAccess or a custom managed
-      policy ARN) if you want to scope down.
+      Managed policy ARN attached to the role. Defaults to ReadOnlyAccess
+      for safe demo / inspection use. Override to a wider policy (e.g.
+      PowerUserAccess or AdministratorAccess) only if you understand the
+      blast radius — anyone with the client cert + API Key gets that
+      level of access in your China account.
     AllowedPattern: '^arn:aws-cn:iam::(aws|[0-9]+):policy/.+$'
 
 Resources:
