@@ -1,5 +1,7 @@
 # AWS DevOps Agent — 部署文档
 
+> **Related**：[aws-devops-agent-cn-bridge](https://github.com/RadiumGu/aws-devops-agent-cn-bridge) — 让 Global 分区的 DevOps Agent 能访问 aws-cn 资源的跨分区桥接（CFN + IAM Roles Anywhere）。
+
 > **目标账号**：`<ACCOUNT_ID>`（你自己的 12 位 AWS 账号）
 > **Region**：`<region>`（PetSite 实测在 `ap-northeast-1`）
 > **Agent Space**：`<agent-space-name>` (`<AGENT_SPACE_UUID>`)
