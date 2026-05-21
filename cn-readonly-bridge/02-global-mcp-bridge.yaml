@@ -1,29 +1,19 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  [Step 2 / Global Account / e.g. us-east-1]
-  MCP bridge that lets the AWS DevOps Agent (Global partition only) operate
-  on China-region (aws-cn) resources via IAM Roles Anywhere with the
-  managed policy attached to the China-side role (default: ReadOnlyAccess).
+  [Step 2 / Global Account] MCP bridge for AWS DevOps Agent to operate
+  on aws-cn resources via Roles Anywhere using the managed policy from
+  Step 1 (default: ReadOnlyAccess). Optionally hosts stdio-only awslabs
+  MCP servers (cloudwatch / eks / ...) behind mcp-proxy.
 
-  Architecture: DevOps Agent -> CloudFront (HTTPS) -> ALB (HTTP, header
-  auth, ingress restricted to CloudFront origin-facing prefix list) ->
-  EC2 running awslabs.aws-api-mcp-server -> aws_signing_helper -> IAM Roles
-  Anywhere (China partition) -> aws-cn APIs.
+  DevOps Agent -> CloudFront -> ALB (X-API-Key) -> EC2 running
+  aws-api-mcp-server (:8000) + mcp-proxy (:8001) -> Roles Anywhere -> aws-cn.
 
-  WARNING: the effective scope of access depends on the managed policy you
-  attached in Step 1 (ManagedPolicyArn parameter). If you widened it beyond
-  the default ReadOnlyAccess, possession of the X-API-Key + reachability of
-  CloudFront = that level of control of the China account during credential
-  validity. Lock down AllowedAdminCidrs and rotate the API key after any
-  incident.
+  WARNING: scope = the managed policy from Step 1. X-API-Key + CloudFront
+  reach gives that level of access. Lock AllowedAdminCidrs; rotate keys.
 
-  Prerequisites:
-    1. Deploy 01-cn-roles-anywhere.yaml in the China account first.
-    2. Generate a client X.509 cert/key signed by the CA you registered in
-       Step 1, then upload them to SSM Parameter Store as SecureString:
-         /devops-agent-cn-bridge/client-cert
-         /devops-agent-cn-bridge/client-key
-       (or override the parameter names below).
+  Prerequisites: deploy 01-cn-roles-anywhere.yaml first; upload client
+  cert/key to SSM SecureString /devops-agent-cn-bridge/client-cert and
+  /client-key (or override below).
 
 Parameters:
   # ---- Roles Anywhere references (from Step 1 outputs) ----
@@ -91,12 +81,17 @@ Parameters:
   # ---- EC2 ----
   InstanceType:
     Type: String
-    Default: t3.small
+    Default: t3.medium
     AllowedValues:
       - t3.small
       - t3.medium
       - t3.large
       - m5.large
+    Description: >
+      EC2 size. t3.medium (4GB) is the recommended floor when running the
+      bundled multi-MCP setup (aws-api-mcp + mcp-proxy hosting cloudwatch /
+      eks / cost-explorer). Drop to t3.small only if you disabled mcp-proxy
+      via EnableMcpProxy=false.
 
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -110,6 +105,36 @@ Parameters:
       newest release (recommended per requirement). Pin to a specific version
       (e.g. '0.2.5') if you need reproducible deployments.
 
+  EnableMcpProxy:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether to also run mcp-proxy on :8001 to expose additional stdio-only
+      awslabs MCP servers (cloudwatch / eks / cost-explorer / ...) under
+      /servers/<name>/* paths. Set 'false' to keep only the original
+      aws-api-mcp-server on :8000.
+
+  McpProxyVersion:
+    Type: String
+    Default: '0.10.2'
+    Description: >
+      Pinned mcp-proxy (sparfenyuk/mcp-proxy) version. mcp-proxy is a
+      community project; pin a known-good version rather than 'latest'.
+      Override only after vetting newer releases.
+
+  McpProxyServers:
+    Type: String
+    Default: 'cloudwatch,eks,cost-explorer'
+    Description: >
+      Comma-separated list of awslabs MCP server short names to host under
+      mcp-proxy. Each name maps to a uvx package 'awslabs.<name>-mcp-server'
+      at version 'latest' and is served at /servers/<name>/mcp. Pass an empty
+      string '' to start mcp-proxy with no named servers (status endpoint
+      still works). Examples: 'cloudwatch', 'cloudwatch,eks',
+      'cloudwatch,eks,cost-explorer,prometheus'.
+    AllowedPattern: '^([a-z0-9-]+(,[a-z0-9-]+)*)?$'
+
   AwsSigningHelperVersion:
     Type: String
     Default: '1.4.0'
@@ -117,6 +142,10 @@ Parameters:
 
 Conditions:
   WithCloudFront: !Equals [!Ref EnableCloudFront, 'true']
+  WithMcpProxy: !Equals [!Ref EnableMcpProxy, 'true']
+  WithCloudFrontAndMcpProxy: !And
+    - !Condition WithCloudFront
+    - !Condition WithMcpProxy
   HasAdminCidr0: !Not [!Equals [!Join ['', !Ref AllowedAdminCidrs], '']]
   HasAdminCidr1: !And
     - !Condition HasAdminCidr0
@@ -309,9 +338,9 @@ Resources:
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 8000
-          ToPort: 8000
+          ToPort: 8001
           SourceSecurityGroupId: !Ref ALBSecurityGroup
-          Description: MCP Server port from ALB only
+          Description: MCP Server (8000 aws-api, 8001 mcp-proxy) from ALB only
       Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-ec2-sg'}]
 
   # ===================== Secrets Manager (ALB API Key) =====================
@@ -387,9 +416,64 @@ Resources:
             HttpHeaderName: X-API-Key
             Values:
               - !Sub '{{resolve:secretsmanager:${AWS::StackName}/alb-api-key}}'
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /mcp
+              - /mcp/*
       Actions:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
+
+  # ===================== mcp-proxy (multi-MCP gateway, optional) =====================
+  # mcp-proxy hosts multiple stdio-only awslabs MCP servers behind one HTTP
+  # endpoint, exposing each as /servers/<name>/mcp. Most awslabs MCP servers
+  # (cloudwatch, eks, cost-explorer, ...) hardcode `mcp.run()` (stdio) and
+  # cannot listen HTTP themselves; this is the standard bridge for that.
+  McpProxyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: WithMcpProxy
+    Properties:
+      Name: !Sub '${AWS::StackName}-proxy-tg'
+      Port: 8001
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /status
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8001'
+      Matcher:
+        # mcp-proxy /status returns 200 when the proxy is running.
+        # Note: this DOES NOT validate that any individual named server
+        # (cloudwatch / eks / ...) can actually spawn its uvx subprocess.
+        HttpCode: '200'
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref EC2Instance
+          Port: 8001
+
+  McpProxyListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: WithMcpProxy
+    Properties:
+      ListenerArn: !Ref HTTPListener
+      Priority: 10
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-API-Key
+            Values:
+              - !Sub '{{resolve:secretsmanager:${AWS::StackName}/alb-api-key}}'
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /servers/*
+              - /status
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref McpProxyTargetGroup
 
   # ===================== CloudFront (optional) =====================
   CloudFrontDistribution:
@@ -548,6 +632,69 @@ Resources:
           systemctl enable mcp-cn-bridge
           systemctl start mcp-cn-bridge
 
+          # ---- mcp-proxy: HTTP gateway for stdio-only awslabs MCP servers ----
+          # Generates /opt/mcp-bridge/mcp-proxy-servers.json from the
+          # CFN McpProxyServers parameter (a comma-separated string), then
+          # runs mcp-proxy on :8001. Each server name <NAME> resolves to
+          # package awslabs.<NAME>-mcp-server at version 'latest' and is
+          # served at /servers/<NAME>/mcp.
+          # In CFN Sub: dollar-brace-var = CFN substitution; dollar-brace-bang-var = literal $var for bash.
+          if [ "${EnableMcpProxy}" = "true" ]; then
+            dnf install -y jq || yum install -y jq
+
+            MCP_NAMES="${McpProxyServers}"
+            CN_REGION="${CnRegion}"
+            JSON='{"mcpServers":{}}'
+            # Build JSON by piping each name through jq.
+            # ${!FOO} escapes from CFN !Sub so bash sees $FOO.
+            for name in $(echo "${!MCP_NAMES}" | tr ',' ' '); do
+              name_trimmed=$(echo "${!name}" | tr -d '[:space:]')
+              [ -z "${!name_trimmed}" ] && continue
+              JSON=$(echo "${!JSON}" | jq --arg n "${!name_trimmed}" --arg region "${!CN_REGION}" '
+                .mcpServers[$n] = {
+                  command: "/root/.local/bin/uvx",
+                  args: ["awslabs.\($n)-mcp-server@latest"],
+                  env: {
+                    AWS_PROFILE: "china-readonly",
+                    AWS_REGION: $region,
+                    AWS_CONFIG_FILE: "/home/ec2-user/.aws/config",
+                    FASTMCP_LOG_LEVEL: "INFO"
+                  }
+                }')
+            done
+            echo "${!JSON}" | jq . > /opt/mcp-bridge/mcp-proxy-servers.json
+
+            cat > /etc/systemd/system/mcp-proxy.service << PROXYEOF
+          [Unit]
+          Description=mcp-proxy - HTTP gateway for stdio MCP servers
+          After=network-online.target mcp-cn-bridge.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          Environment="HOME=/home/ec2-user"
+          Environment="PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin"
+          Environment="AWS_CONFIG_FILE=/home/ec2-user/.aws/config"
+          ExecStart=/root/.local/bin/uvx mcp-proxy@${McpProxyVersion} \
+              --port 8001 \
+              --host 0.0.0.0 \
+              --pass-environment \
+              --named-server-config /opt/mcp-bridge/mcp-proxy-servers.json
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=append:/var/log/mcp-proxy.log
+          StandardError=append:/var/log/mcp-proxy.log
+
+          [Install]
+          WantedBy=multi-user.target
+          PROXYEOF
+
+            systemctl daemon-reload
+            systemctl enable mcp-proxy
+            systemctl start mcp-proxy
+          fi
+
 Outputs:
   AlbDnsName:
     Value: !GetAtt ApplicationLoadBalancer.DNSName
@@ -561,6 +708,29 @@ Outputs:
     Condition: WithCloudFront
     Value: !Sub 'https://${CloudFrontDistribution.DomainName}/mcp'
     Description: HTTPS MCP endpoint via CloudFront — register this with the DevOps Agent.
+
+  McpProxyEndpointHttp:
+    Condition: WithMcpProxy
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}/servers/'
+    Description: >
+      Base URL for mcp-proxy named servers. Append <name>/mcp where <name>
+      is one of McpProxyServers (e.g. cloudwatch, eks). Direct ALB — testing only.
+
+  McpProxyEndpointHttps:
+    Condition: WithCloudFrontAndMcpProxy
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/servers/'
+    Description: >
+      HTTPS base URL for mcp-proxy named servers via CloudFront. Append
+      <name>/mcp (e.g. /servers/cloudwatch/mcp) when registering with DevOps Agent.
+      Only emitted when both EnableCloudFront=true and EnableMcpProxy=true.
+
+  McpProxyStatusEndpoint:
+    Condition: WithMcpProxy
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}/status'
+    Description: >
+      mcp-proxy /status endpoint (requires X-API-Key header). Returns 200 +
+      list of named servers. Use for smoke checks; does NOT validate that
+      individual stdio subprocesses can actually spawn.
 
   ApiKeySecretArn:
     Value: !Ref ApiKeySecret

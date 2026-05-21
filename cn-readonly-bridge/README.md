@@ -28,11 +28,16 @@
 DevOps Agent (Global, e.g. us-east-1)
    │  HTTPS + X-API-Key
    ▼
-CloudFront ──► ALB(:80, Header 校验, SG=CloudFront prefix list) ──► EC2 (MCP Server :8000)
-                                                                        │ credential_process
-                                                                        ▼
-                                                          aws_signing_helper ──► IAM Roles Anywhere
-                                                          (X.509 client cert)    (cn-northwest-1)
+CloudFront ──► ALB(:80) ──► EC2
+                          ├─ :8000  aws-api-mcp-server      (path: /mcp)
+                          └─ :8001  mcp-proxy                (path: /servers/<name>/mcp)
+                                       ├─ spawns awslabs.cloudwatch-mcp-server (stdio)
+                                       ├─ spawns awslabs.eks-mcp-server (stdio)
+                                       └─ spawns awslabs.cost-explorer-mcp-server (stdio)
+                                       │
+                                       ▼ credential_process (共享)
+                                aws_signing_helper ──► IAM Roles Anywhere
+                                (X.509 client cert)    (cn-northwest-1)
                                                                         │ 1h 临时凭证 (ReadOnly default)
                                                                         ▼
                                                                   aws-cn API
@@ -45,7 +50,7 @@ CloudFront ──► ALB(:80, Header 校验, SG=CloudFront prefix list) ──�
 | 文件 | 部署位置 | 作用 |
 |------|---------|------|
 | `01-cn-roles-anywhere.yaml` | **中国账号 / cn-northwest-1** | Trust Anchor + Profile + Read-Only IAM Role（可 opt-in 到 Admin）|
-| `02-global-mcp-bridge.yaml` | **Global 账号 / us-east-1** | VPC + ALB(prefix list) + CloudFront + EC2(MCP server) |
+| `02-global-mcp-bridge.yaml` | **Global 账号 / us-east-1** | VPC + ALB(prefix list) + CloudFront + EC2 跑 aws-api-mcp-server (:8000) 和 mcp-proxy (:8001，多 MCP server 网关) |
 
 ---
 
@@ -194,6 +199,36 @@ curl -sS "$ENDPOINT" \
 `McpServerVersion=latest`（默认）。EC2 重启或重建时拉最新版。
 风险：上游 `awslabs.aws-api-mcp-server` 出 breaking change 会让桥服务挂掉。
 出问题时把参数改成具体版本（例如 `0.2.5`）做 update-stack 即可回退。
+
+### 多 MCP server 静态扩展（mcp-proxy on :8001）
+
+除了 `aws-api-mcp-server`，其他 awslabs MCP server (cloudwatch / eks / cost-explorer / ...) 都是原生 stdio（看 `mcp.run()` 源码，FastMCP 不从环境变量读 transport）。在同一 EC2 跑一个 [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy)（sparfenyuk/mcp-proxy）进程，用 *Named Servers* 模式多实例存放，每个 server 映射到 `/servers/<name>/mcp` path。
+
+漟加/减只需改 CFN `McpProxyServers` 参数（逗号分隔字符串，默认 `cloudwatch,eks,cost-explorer`） → update-stack，EC2 UserData 重生成 `/opt/mcp-bridge/mcp-proxy-servers.json` + restart，不需动 ALB / TG。
+
+```
+# 示例：只启 cloudwatch 和 eks
+ManagedPolicyArn=...ReadOnlyAccess
+McpProxyServers='cloudwatch,eks'
+
+# 完全关闭 mcp-proxy、只保留 aws-api-mcp-server
+EnableMcpProxy=false
+```
+
+注册到 DevOps Agent 时，每个 server 一个 endpoint URL：
+```bash
+ENDPOINT_BASE="https://${CFN_DOMAIN}"
+aws bedrock-agent register-service --service-name agent-cn-aws-api \
+  --service-config "{\"endpoint\":\"$ENDPOINT_BASE/mcp\",\"apiKey\":\"$API_KEY\"}"
+for srv in cloudwatch eks cost-explorer; do
+  aws bedrock-agent register-service --service-name agent-cn-$srv \
+    --service-config "{\"endpoint\":\"$ENDPOINT_BASE/servers/$srv/mcp\",\"apiKey\":\"$API_KEY\"}"
+done
+```
+
+健康检查：`curl -H 'X-API-Key: ...' $ENDPOINT_BASE/status` — mcp-proxy 自带的状态端点。返回 200 + JSON 表示哪些 named server 启用。
+
+注意：mcp-proxy 是社区项目，默认 *釘版本* `0.10.2`（不跳 `latest`，避免 breaking change）。需要升级手动改 `McpProxyVersion` 参数。
 
 ### API Key 旋转的局限
 
