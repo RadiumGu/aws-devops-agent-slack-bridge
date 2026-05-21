@@ -1,0 +1,24 @@
+# Local secrets — do not commit
+.env
+
+# Build artifacts
+.build/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.verify/
+
+# IAM backups (local-only snapshots before policy changes)
+iam/backups/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

@@ -1,0 +1,4 @@
+{
+  "source": ["aws.aidevops"],
+  "detail-type": ["Investigation Completed"]
+}

@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DevOpsAgentBacklog",
+      "Effect": "Allow",
+      "Action": [
+        "aidevops:CreateBacklogTask",
+        "aidevops:GetBacklogTask",
+        "aidevops:ListJournalRecords",
+        "aidevops:ListBacklogTasks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DevOpsAgentChat",
+      "Effect": "Allow",
+      "Action": [
+        "aidevops:CreateChat",
+        "aidevops:SendMessage",
+        "aidevops:ListChats",
+        "aidevops:ListPendingMessages"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
