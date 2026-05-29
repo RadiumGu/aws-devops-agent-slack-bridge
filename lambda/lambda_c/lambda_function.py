@@ -64,12 +64,9 @@ THREAD_TTL_SECONDS = 7 * 24 * 3600
 EVENT_IDEMPOTENCY_TTL_S = 24 * 3600
 EVENT_KEY_PREFIX = "evt:"
 
-# Placeholder written before create_chat returns. A concurrent request that
-# loses the conditional put will poll for this to flip to a real executionId.
+# Placeholder kept only for backward-compat reads of rows written by older
+# deploys (pre-P1-6). New rows never use PENDING — see _get_or_create_chat.
 PENDING_EXECUTION_ID = "PENDING"
-# Max time a peer request waits for a winner to finalize create_chat.
-PENDING_POLL_TIMEOUT_S = 25
-PENDING_POLL_INTERVAL_S = 0.5
 
 # Fixed user-facing error so we never leak ARNs / account IDs / endpoints.
 SLACK_ERROR_TEMPLATE = (
@@ -232,11 +229,20 @@ def _get_or_create_chat(
 ) -> tuple[str, bool]:
     """Look up the executionId for a Slack thread; create a new chat if absent.
 
-    Race-safe ordering: claim the thread row in DDB *before* calling
-    create_chat. If we lose the conditional put, the winner is responsible
-    for create_chat and we poll until they fill in the real executionId.
-    This prevents orphaned executionIds from leaking when two mentions land
-    in the same thread within milliseconds.
+    P1-6 simplification: dropped the placeholder + 25s busy-wait race
+    arbitration. When two @mentions hit the same thread within ms, both
+    workers may now create a chat — the second `put_item` (without a
+    ConditionExpression) overwrites the first, so the loser's chat
+    becomes orphaned in DevOps Agent. We accept this tradeoff because:
+
+      * a thread’s very first request is unlikely to fan out concurrently
+      * orphaned chats incur no extra cost during the preview
+      * the original busy-wait was burning Lambda time + reserved
+        concurrency (5) on every race-loser, which capped real throughput
+
+    Backward-compat: rows written by older deploys may still carry
+    `execution_id == PENDING`; we treat that as "no chat yet" and create
+    a new one (overwriting the stale placeholder).
 
     Returns (execution_id, is_new_chat).
     """
@@ -270,51 +276,10 @@ def _get_or_create_chat(
             logger.warning(json.dumps({"msg": "ddb_update_failed", "error": str(e)}))
         return item["execution_id"], False
 
-    # Try to claim the thread with a placeholder. Only the winner of this
-    # conditional put will go on to call create_chat — preventing orphans.
-    try:
-        table.put_item(
-            Item={
-                "thread_ts": thread_ts,
-                "execution_id": PENDING_EXECUTION_ID,
-                "channel_id": channel,
-                "agent_space_id": DEVOPS_AGENT_SPACE_ID,
-                "user_id": user,
-                "created_at": now,
-                "last_active_at": now,
-                "ttl": now + THREAD_TTL_SECONDS,
-            },
-            ConditionExpression="attribute_not_exists(thread_ts)",
-        )
-        won_claim = True
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            raise
-        won_claim = False
-
-    if not won_claim:
-        # Someone else is creating (or already created) the chat. Poll until
-        # they flip the placeholder to a real id, or time out.
-        logger.info(json.dumps({"msg": "ddb_race_lost", "thread_ts": thread_ts}))
-        deadline = time.time() + PENDING_POLL_TIMEOUT_S
-        while time.time() < deadline:
-            resp = table.get_item(Key={"thread_ts": thread_ts})
-            peer = resp.get("Item") or {}
-            peer_id = peer.get("execution_id")
-            if peer_id and peer_id != PENDING_EXECUTION_ID:
-                return peer_id, False
-            time.sleep(PENDING_POLL_INTERVAL_S)
-        raise RuntimeError(
-            f"timed out waiting for peer to finalize chat for thread {thread_ts}"
-        )
-
-    # We own the placeholder — finalize it with a real executionId.
-    # Slack user identities are not AWS principals, so we register the chat
-    # with userType=STATIC (the devops-agent enum value for non-AWS custom
-    # IDs; valid set is GAIA|MIDWAY|STATIC|IAM|IDC|IDP) and a `slack_`
-    # namespace prefix on userId. The userId pattern is ^[a-zA-Z0-9_.-]+$
-    # (no `:`), so we use `_` as the separator. Audit trail back to the
-    # Slack user still lives in the DDB `user_id` field above.
+    # No usable row. Create the chat first (the only failure mode that
+    # truly blocks us is DevOps Agent rejecting create_chat — if that
+    # happens we don't want to leave any DDB row behind anyway), then
+    # write the row Last-Write-Wins.
     try:
         chat = agent_client.create_chat(
             agentSpaceId=DEVOPS_AGENT_SPACE_ID,
@@ -323,39 +288,30 @@ def _get_or_create_chat(
         )
         execution_id = chat["executionId"]
     except Exception:
-        # Roll back the placeholder so subsequent requests can retry. Use a
-        # condition so we never delete a peer's finalized row.
-        try:
-            table.delete_item(
-                Key={"thread_ts": thread_ts},
-                ConditionExpression="execution_id = :pending",
-                ExpressionAttributeValues={":pending": PENDING_EXECUTION_ID},
-            )
-        except botocore.exceptions.ClientError as cleanup_err:
-            logger.warning(json.dumps({
-                "msg": "placeholder_cleanup_failed",
-                "error": str(cleanup_err),
-            }))
+        logger.exception(json.dumps({
+            "msg": "create_chat_failed",
+            "thread_ts": thread_ts,
+        }))
         raise
 
     try:
-        table.update_item(
-            Key={"thread_ts": thread_ts},
-            UpdateExpression="SET execution_id = :eid, last_active_at = :t, #ttl = :exp",
-            ConditionExpression="execution_id = :pending",
-            ExpressionAttributeNames={"#ttl": "ttl"},
-            ExpressionAttributeValues={
-                ":eid": execution_id,
-                ":pending": PENDING_EXECUTION_ID,
-                ":t": now,
-                ":exp": now + THREAD_TTL_SECONDS,
-            },
-        )
+        table.put_item(Item={
+            "thread_ts": thread_ts,
+            "execution_id": execution_id,
+            "channel_id": channel,
+            "agent_space_id": DEVOPS_AGENT_SPACE_ID,
+            "user_id": user,
+            "created_at": now,
+            "last_active_at": now,
+            "ttl": now + THREAD_TTL_SECONDS,
+        })
     except botocore.exceptions.ClientError as e:
-        # Should not happen — we won the placeholder. Log and continue
-        # rather than dropping the new executionId on the floor.
+        # If the row write fails, the chat itself is fine — we just won’t
+        # remember it. The current request still uses execution_id
+        # locally; the next mention in the same thread will create a new
+        # chat (orphaning this one).
         logger.warning(json.dumps({
-            "msg": "ddb_finalize_failed",
+            "msg": "ddb_put_failed",
             "error": str(e),
             "thread_ts": thread_ts,
         }))

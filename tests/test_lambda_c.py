@@ -510,5 +510,115 @@ class EventIdempotencyTests(unittest.TestCase):
         mock_lambda.invoke.assert_called_once()
 
 
+class GetOrCreateChatTests(unittest.TestCase):
+    """P1-6: race-loser busy-wait removed. New behaviour is Last-Write-Wins
+    on the threads row, accepting that two concurrent first-mentions in
+    the same thread will create two chats (one becomes orphaned)."""
+
+    def test_existing_finalized_row_is_reused(self):
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {
+            "Item": {
+                "thread_ts": "100.0",
+                "execution_id": "exec-existing",
+            },
+        }
+        mock_agent = MagicMock()
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table):
+            execution_id, is_new = lambda_c._get_or_create_chat(
+                thread_ts="100.0", channel="C1", user="U1",
+                agent_client=mock_agent,
+            )
+        self.assertEqual(execution_id, "exec-existing")
+        self.assertFalse(is_new)
+        mock_agent.create_chat.assert_not_called()
+        mock_table.update_item.assert_called_once()  # touched last_active_at
+
+    def test_no_row_creates_new_chat(self):
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {}  # no Item
+        mock_agent = MagicMock()
+        mock_agent.create_chat.return_value = {"executionId": "exec-new"}
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table):
+            execution_id, is_new = lambda_c._get_or_create_chat(
+                thread_ts="100.0", channel="C1", user="U1",
+                agent_client=mock_agent,
+            )
+        self.assertEqual(execution_id, "exec-new")
+        self.assertTrue(is_new)
+        mock_agent.create_chat.assert_called_once()
+        # Plain put_item (no ConditionExpression) -> Last-Write-Wins
+        mock_table.put_item.assert_called_once()
+        kwargs = mock_table.put_item.call_args.kwargs
+        self.assertNotIn("ConditionExpression", kwargs)
+        self.assertEqual(kwargs["Item"]["execution_id"], "exec-new")
+
+    def test_legacy_pending_row_treated_as_no_chat(self):
+        # Backward-compat: rows from older deploys may still carry PENDING.
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {
+            "Item": {
+                "thread_ts": "100.0",
+                "execution_id": lambda_c.PENDING_EXECUTION_ID,
+            },
+        }
+        mock_agent = MagicMock()
+        mock_agent.create_chat.return_value = {"executionId": "exec-fresh"}
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table):
+            execution_id, is_new = lambda_c._get_or_create_chat(
+                thread_ts="100.0", channel="C1", user="U1",
+                agent_client=mock_agent,
+            )
+        self.assertEqual(execution_id, "exec-fresh")
+        self.assertTrue(is_new)
+        mock_agent.create_chat.assert_called_once()
+        mock_table.put_item.assert_called_once()
+
+    def test_create_chat_failure_does_not_write_row(self):
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {}
+        mock_agent = MagicMock()
+        mock_agent.create_chat.side_effect = RuntimeError("agent down")
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table):
+            with self.assertRaises(RuntimeError):
+                lambda_c._get_or_create_chat(
+                    thread_ts="100.0", channel="C1", user="U1",
+                    agent_client=mock_agent,
+                )
+        # No DDB write attempted when create_chat itself failed
+        mock_table.put_item.assert_not_called()
+
+    def test_concurrent_callers_each_get_their_own_chat(self):
+        # Two callers see no row -> each creates a chat -> each writes
+        # without ConditionExpression. The last write wins; the loser
+        # still returns its own execution_id locally for THIS call.
+        from itertools import cycle
+        get_responses = cycle([{}])
+        mock_table = MagicMock()
+        mock_table.get_item.side_effect = lambda **_kw: next(get_responses)
+        agent_a = MagicMock()
+        agent_a.create_chat.return_value = {"executionId": "exec-A"}
+        agent_b = MagicMock()
+        agent_b.create_chat.return_value = {"executionId": "exec-B"}
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table):
+            id_a, _ = lambda_c._get_or_create_chat(
+                thread_ts="77.0", channel="C1", user="U1",
+                agent_client=agent_a,
+            )
+            id_b, _ = lambda_c._get_or_create_chat(
+                thread_ts="77.0", channel="C1", user="U1",
+                agent_client=agent_b,
+            )
+        self.assertEqual(id_a, "exec-A")
+        self.assertEqual(id_b, "exec-B")
+        # No busy-wait, no error
+        self.assertEqual(mock_table.put_item.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
