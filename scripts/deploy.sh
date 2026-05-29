@@ -51,7 +51,7 @@ echo "==> Account=${AWS_ACCOUNT_ID}  Region=${AWS_REGION}  AgentSpace=${DEVOPS_A
 # --------------------------------------------------------------------------
 # 1. Verify caller identity
 # --------------------------------------------------------------------------
-echo "==> [1/8] Verifying caller identity..."
+echo "==> [1/9] Verifying caller identity..."
 ACTUAL_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 if [ "${ACTUAL_ACCOUNT}" != "${AWS_ACCOUNT_ID}" ]; then
   echo "ERROR: caller is in account ${ACTUAL_ACCOUNT}, expected ${AWS_ACCOUNT_ID}"
@@ -61,7 +61,7 @@ fi
 # --------------------------------------------------------------------------
 # 2. IAM role + policies
 # --------------------------------------------------------------------------
-echo "==> [2/8] Creating IAM role ${ROLE_NAME}..."
+echo "==> [2/9] Creating IAM role ${ROLE_NAME}..."
 if ! aws iam get-role --role-name "${ROLE_NAME}" >/dev/null 2>&1; then
   aws iam create-role \
     --role-name "${ROLE_NAME}" \
@@ -197,7 +197,7 @@ echo "    IAM policy TriggerInvestigationDLQAccess attached to ${ROLE_NAME}"
 # --------------------------------------------------------------------------
 # Lambda's built-in boto3 is older than 1.43.0 and does not include the
 # devops-agent client. Bundle a fresh boto3 in a layer.
-echo "==> [3/8] Building boto3 layer (>=${BOTO3_MIN_VERSION})..."
+echo "==> [3/9] Building boto3 layer (>=${BOTO3_MIN_VERSION})..."
 LAYER_BUILD="${BUILD_DIR}/boto3-layer"
 rm -rf "${LAYER_BUILD}"
 mkdir -p "${LAYER_BUILD}/python"
@@ -226,9 +226,42 @@ LAYER_ARN=$(aws lambda publish-layer-version \
 echo "    Layer ARN: ${LAYER_ARN}"
 
 # --------------------------------------------------------------------------
-# 4. Package & deploy Lambda-A (trigger investigation)
+# 4. Ensure DynamoDB threads table (P1-1 alarm idempotency)
 # --------------------------------------------------------------------------
-echo "==> [4/8] Deploying ${LAMBDA_A_NAME}..."
+# Same single-table that the chatbot uses (different partition-key prefix
+# per record class). We create it here too so the alarm pipeline doesn't
+# depend on the chatbot deploy having run.
+echo "==> [4/9] Ensuring DynamoDB threads table for alarm idempotency..."
+DDB_TABLE_NAME="${THREAD_TABLE_NAME:-devops-agent-slack-threads}"
+if aws dynamodb describe-table --region "${AWS_REGION}" \
+     --table-name "${DDB_TABLE_NAME}" >/dev/null 2>&1; then
+  echo "    Table exists: ${DDB_TABLE_NAME}"
+else
+  aws dynamodb create-table --region "${AWS_REGION}" \
+    --table-name "${DDB_TABLE_NAME}" \
+    --attribute-definitions AttributeName=thread_ts,AttributeType=S \
+    --key-schema AttributeName=thread_ts,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --region "${AWS_REGION}" \
+    --table-name "${DDB_TABLE_NAME}"
+  echo "    Created table: ${DDB_TABLE_NAME}"
+fi
+TTL_STATUS=$(aws dynamodb describe-time-to-live --region "${AWS_REGION}" \
+  --table-name "${DDB_TABLE_NAME}" \
+  --query 'TimeToLiveDescription.TimeToLiveStatus' --output text 2>/dev/null || echo "DISABLED")
+if [ "${TTL_STATUS}" != "ENABLED" ] && [ "${TTL_STATUS}" != "ENABLING" ]; then
+  aws dynamodb update-time-to-live --region "${AWS_REGION}" \
+    --table-name "${DDB_TABLE_NAME}" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "    Enabled TTL on ttl attribute"
+else
+  echo "    TTL already ${TTL_STATUS}"
+fi
+
+# --------------------------------------------------------------------------
+# 5. Package & deploy Lambda-A (trigger investigation)
+# --------------------------------------------------------------------------
+echo "==> [5/9] Deploying ${LAMBDA_A_NAME}..."
 ( cd "${ROOT_DIR}/lambda/lambda_a" && zip -qj "${BUILD_DIR}/lambda_a.zip" lambda_function.py )
 
 if aws lambda get-function --region "${AWS_REGION}" --function-name "${LAMBDA_A_NAME}" >/dev/null 2>&1; then
@@ -239,7 +272,7 @@ if aws lambda get-function --region "${AWS_REGION}" --function-name "${LAMBDA_A_
   aws lambda update-function-configuration --region "${AWS_REGION}" \
     --function-name "${LAMBDA_A_NAME}" \
     --layers "${LAYER_ARN}" \
-    --environment "Variables={DEVOPS_AGENT_SPACE_ID=${DEVOPS_AGENT_SPACE_ID}}" >/dev/null
+    --environment "Variables={DEVOPS_AGENT_SPACE_ID=${DEVOPS_AGENT_SPACE_ID},THREAD_TABLE_NAME=${DDB_TABLE_NAME}}" >/dev/null
 else
   aws lambda create-function --region "${AWS_REGION}" \
     --function-name "${LAMBDA_A_NAME}" \
@@ -249,7 +282,7 @@ else
     --zip-file "fileb://${BUILD_DIR}/lambda_a.zip" \
     --timeout 30 --memory-size 128 \
     --layers "${LAYER_ARN}" \
-    --environment "Variables={DEVOPS_AGENT_SPACE_ID=${DEVOPS_AGENT_SPACE_ID}}" >/dev/null
+    --environment "Variables={DEVOPS_AGENT_SPACE_ID=${DEVOPS_AGENT_SPACE_ID},THREAD_TABLE_NAME=${DDB_TABLE_NAME}}" >/dev/null
 fi
 
 # P0-24: attach SQS DLQ for async-invoke failures (EventBridge → Lambda is async).
@@ -277,7 +310,7 @@ aws lambda wait function-updated --region "${AWS_REGION}" --function-name "${LAM
 # --------------------------------------------------------------------------
 # 5. Package & deploy Lambda-B (Slack notifier via webhook)
 # --------------------------------------------------------------------------
-echo "==> [5/8] Deploying ${LAMBDA_B_NAME}..."
+echo "==> [6/9] Deploying ${LAMBDA_B_NAME}..."
 ( cd "${ROOT_DIR}/lambda/lambda_b" && zip -qj "${BUILD_DIR}/lambda_b.zip" lambda_function.py )
 
 # P0-6: webhook URL is now in Secrets Manager. Lambda gets only the secret ARN.
@@ -330,7 +363,7 @@ aws lambda wait function-updated --region "${AWS_REGION}" --function-name "${LAM
 # --------------------------------------------------------------------------
 # 6. EventBridge Rule-1: any CloudWatch Alarm → Lambda-A
 # --------------------------------------------------------------------------
-echo "==> [6/8] Creating EventBridge rule ${RULE_1_NAME}..."
+echo "==> [7/9] Creating EventBridge rule ${RULE_1_NAME}..."
 aws events put-rule --region "${AWS_REGION}" \
   --name "${RULE_1_NAME}" \
   --event-pattern "file://${ROOT_DIR}/eventbridge/rule-1-alarm-to-lambda-pattern.json" >/dev/null
@@ -351,7 +384,7 @@ aws events put-targets --region "${AWS_REGION}" \
 # --------------------------------------------------------------------------
 # 7. EventBridge Rule-2: Investigation Completed → Lambda-B
 # --------------------------------------------------------------------------
-echo "==> [7/8] Creating EventBridge rule ${RULE_2_NAME}..."
+echo "==> [8/9] Creating EventBridge rule ${RULE_2_NAME}..."
 aws events put-rule --region "${AWS_REGION}" \
   --name "${RULE_2_NAME}" \
   --event-pattern "file://${ROOT_DIR}/eventbridge/rule-2-investigation-completed-pattern.json" >/dev/null
@@ -372,7 +405,7 @@ aws events put-targets --region "${AWS_REGION}" \
 # --------------------------------------------------------------------------
 # 8. Summary
 # --------------------------------------------------------------------------
-echo "==> [8/8] Deployment complete."
+echo "==> [9/9] Deployment complete."
 cat <<EOF
 
   Account:        ${AWS_ACCOUNT_ID}

@@ -25,6 +25,7 @@ import time
 import urllib.request
 import urllib.error
 import boto3
+from botocore.config import Config
 
 SLACK_WEBHOOK_SECRET_ARN = os.environ["SLACK_WEBHOOK_SECRET_ARN"]
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
@@ -41,8 +42,21 @@ SLACK_BLOCK_LIMIT = 2900
 # up rotations without a redeploy.
 SECRET_CACHE_TTL_S = int(os.environ.get("SECRET_CACHE_TTL_S", "1800"))
 
-_client = boto3.client("devops-agent", region_name=REGION)
-_secrets_client = boto3.client("secretsmanager", region_name=REGION)
+# P1-2: explicit retry/timeout. devops-agent list_journal_records can be
+# slow on large investigations; secretsmanager is fast.
+_DEVOPS_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 5},
+    connect_timeout=5,
+    read_timeout=30,
+)
+_SECRETS_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 5},
+    connect_timeout=3,
+    read_timeout=10,
+)
+
+_client = boto3.client("devops-agent", region_name=REGION, config=_DEVOPS_BOTO_CONFIG)
+_secrets_client = boto3.client("secretsmanager", region_name=REGION, config=_SECRETS_BOTO_CONFIG)
 
 _webhook_url_cache: dict = {"value": None, "expires_at": 0.0}
 
@@ -73,17 +87,34 @@ def get_investigation_summary(agent_space_id: str, execution_id: str) -> str:
 
 
 def _chunk_for_slack(text: str, limit: int = SLACK_BLOCK_LIMIT) -> list[str]:
-    """Split markdown content into <=limit-char chunks at line boundaries."""
+    """Split markdown content into <=limit-char chunks at line boundaries.
+
+    P1-3: hard-split single lines that exceed the limit. Slack rejects an
+    entire block when its text field is >3000 chars, so an oversized line
+    (e.g. a long URL, a stack trace dumped on one line) used to drop the
+    whole investigation summary. We now slice the offending line in fixed
+    `limit`-sized pieces before placing them into chunks.
+    """
     if len(text) <= limit:
         return [text]
+
+    def _split_oversized(line: str) -> list[str]:
+        if len(line) <= limit:
+            return [line]
+        parts = []
+        for i in range(0, len(line), limit):
+            parts.append(line[i:i + limit])
+        return parts
+
     chunks, current = [], ""
-    for line in text.splitlines(keepends=True):
-        if len(current) + len(line) > limit:
-            if current:
-                chunks.append(current)
-            current = line
-        else:
-            current += line
+    for raw_line in text.splitlines(keepends=True):
+        for line in _split_oversized(raw_line):
+            if len(current) + len(line) > limit:
+                if current:
+                    chunks.append(current)
+                current = line
+            else:
+                current += line
     if current:
         chunks.append(current)
     return chunks

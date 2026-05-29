@@ -220,7 +220,8 @@ class HandlerTests(unittest.TestCase):
 
     def test_alarm_state_calls_create_backlog_task(self):
         event = self._alarm_event()
-        with patch.object(lambda_a, "_client") as mock_client:
+        with patch.object(lambda_a, "_client") as mock_client, \
+             patch.object(lambda_a, "_get_thread_table", return_value=None):
             mock_client.create_backlog_task.return_value = {
                 "task": {
                     "taskId": "task-abc",
@@ -236,6 +237,107 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(kwargs["priority"], "HIGH")
         self.assertIn("petsite-cpu-high", kwargs["title"])
         self.assertIn("AWS/EC2", kwargs["description"])
+
+
+class AlarmIdempotencyTests(unittest.TestCase):
+    """P1-1: dedupe EventBridge re-deliveries of the same alarm transition
+    by claiming a row in the threads DDB table keyed on (alarm_name,
+    state.timestamp) before calling create_backlog_task."""
+
+    def _alarm_event(self, *, ts="2026-05-29T07:00:00.123+0000"):
+        return {
+            "account": "111122223333",
+            "region": "ap-northeast-1",
+            "detail": {
+                "alarmName": "petsite-eks-down",
+                "state": {
+                    "value": "ALARM",
+                    "reason": "node loss",
+                    "timestamp": ts,
+                },
+                "configuration": {
+                    "metrics": [{"metricStat": {"metric": {
+                        "namespace": "AWS/EKS",
+                        "name": "NodeCount",
+                        "dimensions": {"ClusterName": "petsite"},
+                    }}}]
+                },
+            },
+        }
+
+    def test_first_delivery_proceeds_and_claims_row(self):
+        from unittest.mock import MagicMock
+        mock_table = MagicMock()  # put_item succeeds
+        mock_client = MagicMock()
+        mock_client.create_backlog_task.return_value = {
+            "task": {"taskId": "t-1", "executionId": "e-1",
+                     "status": "PENDING"}
+        }
+        with patch.object(lambda_a, "_client", mock_client), \
+             patch.object(lambda_a, "_get_thread_table",
+                          return_value=mock_table):
+            result = lambda_a.lambda_handler(self._alarm_event(), None)
+        self.assertEqual(result["statusCode"], 200)
+        mock_table.put_item.assert_called_once()
+        item = mock_table.put_item.call_args.kwargs["Item"]
+        self.assertTrue(item["thread_ts"].startswith("alarm:petsite-eks-down:"))
+        self.assertEqual(item["alarm_name"], "petsite-eks-down")
+        self.assertIn("ttl", item)
+        mock_client.create_backlog_task.assert_called_once()
+
+    def test_duplicate_delivery_is_skipped(self):
+        from unittest.mock import MagicMock
+        from botocore.exceptions import ClientError
+        mock_table = MagicMock()
+        mock_table.put_item.side_effect = ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException",
+                       "Message": "already claimed"}},
+            "PutItem",
+        )
+        mock_client = MagicMock()
+        with patch.object(lambda_a, "_client", mock_client), \
+             patch.object(lambda_a, "_get_thread_table",
+                          return_value=mock_table):
+            result = lambda_a.lambda_handler(self._alarm_event(), None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("duplicate alarm", result["body"])
+        mock_client.create_backlog_task.assert_not_called()
+
+    def test_ddb_throttle_fails_open(self):
+        from unittest.mock import MagicMock
+        from botocore.exceptions import ClientError
+        mock_table = MagicMock()
+        mock_table.put_item.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException",
+                       "Message": "throttle"}},
+            "PutItem",
+        )
+        mock_client = MagicMock()
+        mock_client.create_backlog_task.return_value = {
+            "task": {"taskId": "t-2", "executionId": "e-2",
+                     "status": "PENDING"}
+        }
+        with patch.object(lambda_a, "_client", mock_client), \
+             patch.object(lambda_a, "_get_thread_table",
+                          return_value=mock_table):
+            result = lambda_a.lambda_handler(self._alarm_event(), None)
+        self.assertEqual(result["statusCode"], 200)
+        # Fail-open: backlog task still created
+        mock_client.create_backlog_task.assert_called_once()
+
+    def test_idempotency_disabled_when_table_unset(self):
+        # Older deploys without THREAD_TABLE_NAME env var must still work.
+        from unittest.mock import MagicMock
+        mock_client = MagicMock()
+        mock_client.create_backlog_task.return_value = {
+            "task": {"taskId": "t-3", "executionId": "e-3",
+                     "status": "PENDING"}
+        }
+        with patch.object(lambda_a, "_client", mock_client), \
+             patch.object(lambda_a, "_get_thread_table", return_value=None):
+            result = lambda_a.lambda_handler(self._alarm_event(), None)
+        self.assertEqual(result["statusCode"], 200)
+        mock_client.create_backlog_task.assert_called_once()
 
 
 if __name__ == "__main__":

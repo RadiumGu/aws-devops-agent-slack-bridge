@@ -36,6 +36,7 @@ import urllib.request
 
 import boto3
 import botocore
+from botocore.config import Config
 
 # Local module on the deployment package
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -97,25 +98,56 @@ _ddb_table = None
 _slack_token: str | None = None
 _signing_secret: str | None = None
 
+# P1-2: explicit retry/timeout per service. devops-agent send_message is a
+# streaming API that can run for minutes, so its read_timeout is sized to
+# the Lambda function's own timeout (300s) minus a small safety margin.
+# secretsmanager / lambda / ddb are control-plane fast calls.
+_DEVOPS_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 5},
+    connect_timeout=5,
+    read_timeout=280,
+)
+_SECRETS_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 5},
+    connect_timeout=3,
+    read_timeout=10,
+)
+_LAMBDA_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 3},
+    connect_timeout=3,
+    read_timeout=10,
+)
+_DDB_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 5},
+    connect_timeout=3,
+    read_timeout=10,
+)
+
 
 def _get_secrets_client():
     global _secrets_client
     if _secrets_client is None:
-        _secrets_client = boto3.client("secretsmanager", region_name=REGION)
+        _secrets_client = boto3.client(
+            "secretsmanager", region_name=REGION, config=_SECRETS_BOTO_CONFIG,
+        )
     return _secrets_client
 
 
 def _get_devops_client():
     global _devops_client
     if _devops_client is None:
-        _devops_client = boto3.client("devops-agent", region_name=REGION)
+        _devops_client = boto3.client(
+            "devops-agent", region_name=REGION, config=_DEVOPS_BOTO_CONFIG,
+        )
     return _devops_client
 
 
 def _get_lambda_client():
     global _lambda_client
     if _lambda_client is None:
-        _lambda_client = boto3.client("lambda", region_name=REGION)
+        _lambda_client = boto3.client(
+            "lambda", region_name=REGION, config=_LAMBDA_BOTO_CONFIG,
+        )
     return _lambda_client
 
 
@@ -123,8 +155,9 @@ def _get_thread_table():
     """Lazy-init DDB Table resource for thread_ts → executionId mapping."""
     global _ddb_table
     if _ddb_table is None:
-        _ddb_table = boto3.resource("dynamodb", region_name=REGION).Table(
-            THREAD_TABLE_NAME)
+        _ddb_table = boto3.resource(
+            "dynamodb", region_name=REGION, config=_DDB_BOTO_CONFIG,
+        ).Table(THREAD_TABLE_NAME)
     return _ddb_table
 
 

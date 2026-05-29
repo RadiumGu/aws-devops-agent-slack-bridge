@@ -68,13 +68,26 @@ class ChunkForSlackTests(unittest.TestCase):
         # Reassembled text matches original
         self.assertEqual("".join(chunks), text)
 
-    def test_single_long_line_falls_through(self):
-        # When a single line exceeds the limit, the function still emits it
-        # (Slack will reject — we accept the limitation; behaviour is to
-        # not silently drop content).
+    def test_single_long_line_hard_split(self):
+        # P1-3: A single line exceeding the limit must be hard-split into
+        # <=limit pieces; the previous behaviour was to emit it whole and
+        # let Slack reject the entire block. Reassembled content equals
+        # original.
         big = "y" * 5000
         chunks = lambda_b._chunk_for_slack(big, limit=2000)
+        for c in chunks:
+            self.assertLessEqual(len(c), 2000)
         self.assertEqual("".join(chunks), big)
+        self.assertGreaterEqual(len(chunks), 3)  # 5000 / 2000 -> 3 pieces
+
+    def test_mixed_normal_and_long_line(self):
+        # Long line surrounded by normal lines should still hard-split the
+        # offender while preserving the others.
+        text = "short1\n" + ("z" * 4000) + "\nshort2\n"
+        chunks = lambda_b._chunk_for_slack(text, limit=2000)
+        for c in chunks:
+            self.assertLessEqual(len(c), 2000)
+        self.assertEqual("".join(chunks), text)
 
 
 class FormatDurationTests(unittest.TestCase):

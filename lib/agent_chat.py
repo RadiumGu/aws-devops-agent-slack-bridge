@@ -10,10 +10,20 @@ import json
 import sys
 
 import boto3
+from botocore.config import Config
 
 
 def get_client(region: str):
-    return boto3.client("devops-agent", region_name=region)
+    # P1-2: send_message is a streaming API; size read_timeout to be
+    # comfortably under the typical Lambda 300s timeout but generous
+    # enough for slow Agent responses. Adaptive retries handle
+    # preview-period throttling.
+    cfg = Config(
+        retries={"mode": "adaptive", "max_attempts": 5},
+        connect_timeout=5,
+        read_timeout=280,
+    )
+    return boto3.client("devops-agent", region_name=region, config=cfg)
 
 
 # Block types observed from devops-agent SendMessage stream:

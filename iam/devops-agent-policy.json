@@ -22,6 +22,14 @@
         "aidevops:ListPendingMessages"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "AlarmIdempotencyTable",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem"
+      ],
+      "Resource": "arn:aws:dynamodb:*:*:table/devops-agent-slack-threads"
     }
   ]
 }

@@ -11,12 +11,99 @@ Environment variables:
 """
 import json
 import os
+import time
 import boto3
+import botocore
+from botocore.config import Config
 
 DEVOPS_AGENT_SPACE_ID = os.environ["DEVOPS_AGENT_SPACE_ID"]
 REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 
-_client = boto3.client("devops-agent", region_name=REGION)
+# P1-1: alarm-event idempotency. Reuses the chatbot's threads DDB table
+# (single-table design, distinct partition-key prefixes per record class).
+# When the env var is unset (e.g. older deploys that haven't run the
+# updated deploy.sh), idempotency is silently skipped and we behave like
+# the original implementation.
+THREAD_TABLE_NAME = os.environ.get("THREAD_TABLE_NAME", "")
+ALARM_KEY_PREFIX = "alarm:"
+# Alarms have ms-resolution timestamps; 1-day TTL is more than enough to
+# cover EventBridge re-delivery (which happens within minutes at most).
+ALARM_IDEMPOTENCY_TTL_S = 24 * 3600
+
+# P1-2: explicit retry/timeout. create_backlog_task is a control-plane
+# call (small payload, fast). Adaptive retries cope with throttling on
+# DevOps Agent's preview-period quotas without hammering it.
+_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 5},
+    connect_timeout=5,
+    read_timeout=30,
+)
+_DDB_BOTO_CONFIG = Config(
+    retries={"mode": "adaptive", "max_attempts": 5},
+    connect_timeout=3,
+    read_timeout=10,
+)
+
+_client = boto3.client("devops-agent", region_name=REGION, config=_BOTO_CONFIG)
+
+_ddb_table = None
+
+
+def _get_thread_table():
+    """Lazy-init DDB Table resource. Returns None if THREAD_TABLE_NAME is
+    not configured (idempotency disabled)."""
+    global _ddb_table
+    if not THREAD_TABLE_NAME:
+        return None
+    if _ddb_table is None:
+        _ddb_table = boto3.resource(
+            "dynamodb", region_name=REGION, config=_DDB_BOTO_CONFIG,
+        ).Table(THREAD_TABLE_NAME)
+    return _ddb_table
+
+
+def _claim_alarm_idempotent(alarm_name: str, state_timestamp: str) -> bool:
+    """Atomically claim an (alarmName, state.timestamp) tuple as already
+    handled. Same pattern as Lambda-C's `evt:` rows: shared threads table,
+    distinct key prefix.
+
+    Returns:
+        True  -- first time we've seen this alarm transition; proceed.
+        False -- duplicate (EventBridge redelivery); caller should drop.
+
+    Fail-open: any DDB error (throttling / network / table missing) logs
+    a warning and returns True. We'd rather risk creating a duplicate
+    backlog task than silently drop a real first-arrival alarm.
+    """
+    table = _get_thread_table()
+    if table is None:
+        return True  # idempotency disabled
+    if not (alarm_name and state_timestamp):
+        return True  # missing fields; can't dedup safely
+    now = int(time.time())
+    try:
+        table.put_item(
+            Item={
+                "thread_ts": f"{ALARM_KEY_PREFIX}{alarm_name}:{state_timestamp}",
+                "alarm_name": alarm_name,
+                "state_timestamp": state_timestamp,
+                "processed_at": now,
+                "ttl": now + ALARM_IDEMPOTENCY_TTL_S,
+            },
+            ConditionExpression="attribute_not_exists(thread_ts)",
+        )
+        return True
+    except botocore.exceptions.ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code == "ConditionalCheckFailedException":
+            return False
+        print(json.dumps({
+            "msg": "alarm_idempotency_check_failed",
+            "alarm": alarm_name,
+            "state_timestamp": state_timestamp,
+            "error": str(e),
+        }))
+        return True  # fail-open
 
 # Per-namespace reasoning hints injected into the Investigation details
 # section. The Agent reasons over free-form text, so a tighter hint cuts
@@ -141,6 +228,19 @@ def lambda_handler(event, context):
     account = event.get("account", "")
     region = event.get("region", REGION)
     reason = detail.get("state", {}).get("reason", "N/A")
+
+    # P1-1: drop EventBridge re-deliveries of the same alarm transition.
+    # state.timestamp is the alarm's state-change time; identical retries
+    # share it, while real ALARM->OK->ALARM flips have different values.
+    state_timestamp = detail.get("state", {}).get("timestamp", "")
+    if not _claim_alarm_idempotent(alarm_name, state_timestamp):
+        print(json.dumps({
+            "msg": "skipped_duplicate_alarm",
+            "alarm": alarm_name,
+            "state_timestamp": state_timestamp,
+        }))
+        return {"statusCode": 200,
+                "body": f"Skipped: duplicate alarm {alarm_name}"}
 
     namespace, metric_name, dimensions = _build_starting_point(detail)
 
