@@ -20,12 +20,16 @@ redeploy. To force an immediate refresh you can still trigger a Lambda
 config update (re-run deploy.sh).
 """
 import json
+import logging
 import os
 import time
 import urllib.request
 import urllib.error
 import boto3
 from botocore.config import Config
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 SLACK_WEBHOOK_SECRET_ARN = os.environ["SLACK_WEBHOOK_SECRET_ARN"]
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
@@ -264,7 +268,11 @@ def lambda_handler(event, context):
     task_id = metadata.get("task_id", "unknown")
 
     if not (agent_space_id and execution_id):
-        print(f"WARN: missing metadata, event={json.dumps(event)}")
+        logger.warning(json.dumps({
+            "msg": "missing_metadata",
+            "agent_space_id": agent_space_id,
+            "execution_id": execution_id,
+        }))
         return {"statusCode": 400, "body": "missing metadata"}
 
     status = data.get("status", "")
@@ -283,11 +291,14 @@ def lambda_handler(event, context):
     else:
         # IN_PROGRESS or any other transitional status — stay silent so we
         # don't ping Slack on every state flip.
-        print(f"Skipping non-terminal event: status={status}")
+        logger.info(json.dumps({
+            "msg": "skipped_non_terminal_status",
+            "status": status,
+        }))
         return {"statusCode": 200, "body": f"Skipped: status={status}"}
 
     post_to_slack(blocks, fallback)
-    print(json.dumps({
+    logger.info(json.dumps({
         "msg": "slack_posted",
         "task_id": task_id,
         "execution_id": execution_id,

@@ -417,13 +417,13 @@ def _fast_path(event: dict, context) -> dict:
     try:
         verify_slack_signature(headers, raw_body, _get_signing_secret())
     except SignatureError as e:
-        print(json.dumps({"msg": "signature_rejected", "error": str(e)}))
+        logger.warning(json.dumps({"msg": "signature_rejected", "error": str(e)}))
         return {"statusCode": 401, "body": "invalid signature"}
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except json.JSONDecodeError as e:
-        print(json.dumps({"msg": "json_error", "error": str(e)}))
+        logger.warning(json.dumps({"msg": "json_error", "error": str(e)}))
         return {"statusCode": 400, "body": "bad json"}
 
     # 1. URL verification challenge
@@ -437,7 +437,7 @@ def _fast_path(event: dict, context) -> dict:
     # 2. Slack retry detection
     retry_num = headers.get("x-slack-retry-num")
     if retry_num:
-        print(json.dumps({"msg": "skipped_retry", "retry_num": retry_num}))
+        logger.info(json.dumps({"msg": "skipped_retry", "retry_num": retry_num}))
         return {"statusCode": 200, "body": "ack-retry"}
 
     # 3. Event callbacks
@@ -451,7 +451,7 @@ def _fast_path(event: dict, context) -> dict:
         # fixtures, malformed payloads): skip the check rather than reject.
         event_id = payload.get("event_id")
         if event_id and not _claim_event_idempotent(event_id):
-            print(json.dumps({
+            logger.info(json.dumps({
                 "msg": "skipped_duplicate_event",
                 "event_id": event_id,
             }))
@@ -557,6 +557,9 @@ def _emit_unhandled_message_metric() -> None:
     CloudWatch ingest cost is dominated by message bodies, not counts.
     """
     try:
+        # CloudWatch Embedded Metric Format requires a raw JSON line on
+        # stdout. Lambda's logger wraps lines with [LEVEL]\t<request_id>
+        # which breaks EMF parsing, so this stays as `print` deliberately.
         print(json.dumps({
             "_aws": {
                 "Timestamp": int(time.time() * 1000),
