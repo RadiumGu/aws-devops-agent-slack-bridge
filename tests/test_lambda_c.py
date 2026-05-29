@@ -401,5 +401,114 @@ class ThreadReplyAutoRespondTests(unittest.TestCase):
         mock_lambda.invoke.assert_not_called()
 
 
+class EventIdempotencyTests(unittest.TestCase):
+    """P0-4: Slack event_id duplicate suppression. Same event_id arriving
+    twice (e.g. app_mention + message.channels double-subscribe, or Slack
+    replay) must invoke the worker exactly once."""
+
+    def setUp(self):
+        self.patches = [
+            patch.object(lambda_c, "_get_signing_secret",
+                         return_value=SIGNING_SECRET),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _mention_event(self, event_id: str) -> dict:
+        return _signed_event({
+            "type": "event_callback",
+            "event_id": event_id,
+            "team_id": "T1",
+            "event": {
+                "type": "app_mention",
+                "channel": "C1",
+                "user": "U1",
+                "text": "<@U0BOT123> hello",
+                "ts": "1.0",
+            },
+        })
+
+    def test_first_event_proceeds_and_claims_idempotency_row(self):
+        mock_table = MagicMock()  # put_item succeeds (no ConditionalCheck)
+        mock_lambda = MagicMock()
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table), \
+             patch.object(lambda_c, "_get_lambda_client",
+                          return_value=mock_lambda):
+            result = lambda_c.lambda_handler(
+                self._mention_event("Ev_first"), _ctx(),
+            )
+        self.assertEqual(result["body"], "ack")
+        mock_table.put_item.assert_called_once()
+        item = mock_table.put_item.call_args.kwargs["Item"]
+        self.assertEqual(item["thread_ts"], "evt:Ev_first")
+        self.assertEqual(item["event_id"], "Ev_first")
+        self.assertIn("ttl", item)
+        mock_lambda.invoke.assert_called_once()
+
+    def test_duplicate_event_dropped_without_invoking_worker(self):
+        from botocore.exceptions import ClientError
+        mock_table = MagicMock()
+        mock_table.put_item.side_effect = ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException",
+                       "Message": "already claimed"}},
+            "PutItem",
+        )
+        mock_lambda = MagicMock()
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table), \
+             patch.object(lambda_c, "_get_lambda_client",
+                          return_value=mock_lambda):
+            result = lambda_c.lambda_handler(
+                self._mention_event("Ev_dup"), _ctx(),
+            )
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(result["body"], "ack-duplicate")
+        mock_lambda.invoke.assert_not_called()
+
+    def test_ddb_error_fails_open_and_proceeds(self):
+        from botocore.exceptions import ClientError
+        mock_table = MagicMock()
+        mock_table.put_item.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException",
+                       "Message": "throttle"}},
+            "PutItem",
+        )
+        mock_lambda = MagicMock()
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table), \
+             patch.object(lambda_c, "_get_lambda_client",
+                          return_value=mock_lambda):
+            result = lambda_c.lambda_handler(
+                self._mention_event("Ev_throttle"), _ctx(),
+            )
+        self.assertEqual(result["body"], "ack")
+        mock_lambda.invoke.assert_called_once()
+
+    def test_missing_event_id_skips_idempotency_check(self):
+        body = {
+            "type": "event_callback",
+            "team_id": "T1",
+            "event": {
+                "type": "app_mention",
+                "channel": "C1",
+                "user": "U1",
+                "text": "<@U0BOT123> hi",
+                "ts": "1.0",
+            },
+        }
+        mock_table = MagicMock()
+        mock_lambda = MagicMock()
+        with patch.object(lambda_c, "_get_thread_table",
+                          return_value=mock_table), \
+             patch.object(lambda_c, "_get_lambda_client",
+                          return_value=mock_lambda):
+            result = lambda_c.lambda_handler(_signed_event(body), _ctx())
+        self.assertEqual(result["body"], "ack")
+        mock_table.put_item.assert_not_called()
+        mock_lambda.invoke.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

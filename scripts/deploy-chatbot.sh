@@ -45,7 +45,7 @@ LAMBDA_ARN="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${LAMBDA_C_N
 # --------------------------------------------------------------------------
 # 1. Verify caller
 # --------------------------------------------------------------------------
-echo "==> [1/9] Verifying caller identity..."
+echo "==> [1/10] Verifying caller identity..."
 ACTUAL=$(aws sts get-caller-identity --query Account --output text)
 [ "${ACTUAL}" = "${AWS_ACCOUNT_ID}" ] || {
   echo "ERROR: caller is in account ${ACTUAL}, expected ${AWS_ACCOUNT_ID}"
@@ -55,7 +55,7 @@ ACTUAL=$(aws sts get-caller-identity --query Account --output text)
 # --------------------------------------------------------------------------
 # 2. Attach SlackChatbotAccess policy to existing role
 # --------------------------------------------------------------------------
-echo "==> [2/9] Updating IAM role with SlackChatbotAccess policy..."
+echo "==> [2/10] Updating IAM role with SlackChatbotAccess policy..."
 # Render template (account/region come from .env, kept out of git)
 mkdir -p "${BUILD_DIR}/iam"
 RENDERED_POLICY="${BUILD_DIR}/iam/chatbot-policy.json"
@@ -71,7 +71,7 @@ aws iam put-role-policy \
 # --------------------------------------------------------------------------
 # 3. Look up boto3 layer ARN
 # --------------------------------------------------------------------------
-echo "==> [3/9] Resolving boto3 layer..."
+echo "==> [3/10] Resolving boto3 layer..."
 LAYER_ARN=$(aws lambda list-layer-versions --region "${AWS_REGION}" \
   --layer-name "${LAYER_NAME}" \
   --query 'LayerVersions[0].LayerVersionArn' --output text)
@@ -80,7 +80,7 @@ echo "    Layer: ${LAYER_ARN}"
 # --------------------------------------------------------------------------
 # 4. Package & deploy Lambda-C
 # --------------------------------------------------------------------------
-echo "==> [4/9] Packaging Lambda-C..."
+echo "==> [4/10] Packaging Lambda-C..."
 ZIP="${BUILD_DIR}/lambda_c.zip"
 rm -f "${ZIP}"
 # zip -j flattens paths so agent_chat.py lands at the zip root next to
@@ -119,27 +119,75 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# 5. Create / reuse API Gateway HTTP API
+# 5. Ensure DynamoDB threads table (P0-1)
 # --------------------------------------------------------------------------
-echo "==> [5/9] Setting up API Gateway HTTP API..."
+# Lambda-C reads/writes thread state via this table; the IAM policy + the
+# CloudWatch DDB-throttle alarm below already reference its name. Create it
+# here so a fresh deploy is fully self-contained (no manual aws CLI step).
+echo "==> [5/10] Ensuring DynamoDB threads table..."
+DDB_TABLE_NAME="${THREAD_TABLE_NAME:-devops-agent-slack-threads}"
+if aws dynamodb describe-table --region "${AWS_REGION}" \
+     --table-name "${DDB_TABLE_NAME}" >/dev/null 2>&1; then
+  echo "    Table exists: ${DDB_TABLE_NAME}"
+else
+  aws dynamodb create-table --region "${AWS_REGION}" \
+    --table-name "${DDB_TABLE_NAME}" \
+    --attribute-definitions AttributeName=thread_ts,AttributeType=S \
+    --key-schema AttributeName=thread_ts,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST >/dev/null
+  aws dynamodb wait table-exists --region "${AWS_REGION}" \
+    --table-name "${DDB_TABLE_NAME}"
+  echo "    Created table: ${DDB_TABLE_NAME}"
+fi
+# Enable TTL on the `ttl` attribute (idempotent; describe + skip if already on).
+TTL_STATUS=$(aws dynamodb describe-time-to-live --region "${AWS_REGION}" \
+  --table-name "${DDB_TABLE_NAME}" \
+  --query 'TimeToLiveDescription.TimeToLiveStatus' --output text 2>/dev/null || echo "DISABLED")
+if [ "${TTL_STATUS}" != "ENABLED" ] && [ "${TTL_STATUS}" != "ENABLING" ]; then
+  aws dynamodb update-time-to-live --region "${AWS_REGION}" \
+    --table-name "${DDB_TABLE_NAME}" \
+    --time-to-live-specification "Enabled=true,AttributeName=ttl" >/dev/null
+  echo "    Enabled TTL on ttl attribute"
+else
+  echo "    TTL already ${TTL_STATUS}"
+fi
+
+# --------------------------------------------------------------------------
+# 6. Create / reuse API Gateway HTTP API (P0-3: no --target shortcut)
+# --------------------------------------------------------------------------
+echo "==> [6/10] Setting up API Gateway HTTP API..."
 
 API_ID=$(aws apigatewayv2 get-apis --region "${AWS_REGION}" \
   --query "Items[?Name=='${API_NAME}'].ApiId | [0]" --output text)
 
 if [ "${API_ID}" = "None" ] || [ -z "${API_ID}" ]; then
+  # Avoid `--target`: it auto-creates an ANY catch-all route + $default
+  # integration that will accept any HTTP method/path. We want exactly one
+  # explicit route (POST /slack/events) to minimise unauthenticated
+  # invocation surface (Slack signing check still runs, but unauthenticated
+  # traffic would still consume Lambda invocations).
   API_ID=$(aws apigatewayv2 create-api --region "${AWS_REGION}" \
     --name "${API_NAME}" \
     --protocol-type HTTP \
-    --target "${LAMBDA_ARN}" \
     --query 'ApiId' --output text)
   echo "    Created API: ${API_ID}"
-  # The --target shortcut creates a default integration + ANY route + $default stage
 else
   echo "    Reusing API: ${API_ID}"
+  # If a previous deploy used --target, an ANY catch-all route from that run
+  # may still exist. Remove any non-POST-/slack/events routes (idempotent).
+  for stale in $(aws apigatewayv2 get-routes --region "${AWS_REGION}" \
+      --api-id "${API_ID}" \
+      --query "Items[?RouteKey!='POST /slack/events'].RouteId" \
+      --output text); do
+    [ -n "${stale}" ] && [ "${stale}" != "None" ] || continue
+    aws apigatewayv2 delete-route --region "${AWS_REGION}" \
+      --api-id "${API_ID}" --route-id "${stale}" >/dev/null
+    echo "    Removed stale route: ${stale}"
+  done
 fi
 
-# Ensure an explicit POST /slack/events route (in addition to whatever
-# --target shortcut created). This is what Slack will call.
+# Ensure an explicit POST /slack/events route. Without --target there is no
+# default integration/route, so we always create both.
 INTEG_ID=$(aws apigatewayv2 get-integrations --region "${AWS_REGION}" \
   --api-id "${API_ID}" \
   --query "Items[?IntegrationUri=='${LAMBDA_ARN}'].IntegrationId | [0]" \
@@ -161,7 +209,11 @@ aws apigatewayv2 create-route --region "${AWS_REGION}" \
   --target "integrations/${INTEG_ID}" >/dev/null 2>&1 || \
   echo "    POST /slack/events route already exists"
 
-# Auto-deploy on default stage (already done by --target shortcut, but ensure)
+# Default stage with auto-deploy (no longer comes for free without --target)
+aws apigatewayv2 get-stage --region "${AWS_REGION}" \
+  --api-id "${API_ID}" --stage-name '$default' >/dev/null 2>&1 || \
+  aws apigatewayv2 create-stage --region "${AWS_REGION}" \
+    --api-id "${API_ID}" --stage-name '$default' --auto-deploy >/dev/null
 aws apigatewayv2 update-stage --region "${AWS_REGION}" \
   --api-id "${API_ID}" --stage-name '$default' \
   --auto-deploy >/dev/null 2>&1 || true
@@ -178,18 +230,18 @@ aws lambda add-permission --region "${AWS_REGION}" \
 INVOKE_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/slack/events"
 
 # --------------------------------------------------------------------------
-# 6. Reserved concurrency (P0-2): cap blast radius if URL leaks
+# 7. Reserved concurrency (P0-2): cap blast radius if URL leaks
 # --------------------------------------------------------------------------
-echo "==> [6/9] Setting reserved concurrency to ${RESERVED_CONCURRENCY}..."
+echo "==> [7/10] Setting reserved concurrency to ${RESERVED_CONCURRENCY}..."
 aws lambda put-function-concurrency --region "${AWS_REGION}" \
   --function-name "${LAMBDA_C_NAME}" \
   --reserved-concurrent-executions "${RESERVED_CONCURRENCY}" >/dev/null
 echo "    Reserved concurrency: ${RESERVED_CONCURRENCY}"
 
 # --------------------------------------------------------------------------
-# 7. SQS DLQ + OnFailure destination (P0-4): catch async-invoke drops
+# 8. SQS DLQ + OnFailure destination (P0-4): catch async-invoke drops
 # --------------------------------------------------------------------------
-echo "==> [7/9] Configuring SQS DLQ for async invoke failures..."
+echo "==> [8/10] Configuring SQS DLQ for async invoke failures..."
 
 # Create or reuse DLQ (idempotent — create-queue is no-op if attrs match)
 DLQ_URL=$(aws sqs create-queue --region "${AWS_REGION}" \
@@ -246,11 +298,11 @@ for attempt in 1 2 3 4 5; do
 done
 
 # --------------------------------------------------------------------------
-# 8. CloudWatch alarms (P1-13): Lambda-C errors / API GW 5xx / DDB throttle
+# 9. CloudWatch alarms (P1-13): Lambda-C errors / API GW 5xx / DDB throttle
 # --------------------------------------------------------------------------
-echo "==> [8/9] Setting up CloudWatch alarms..."
+echo "==> [9/10] Setting up CloudWatch alarms..."
 
-DDB_TABLE_NAME="${THREAD_TABLE_NAME:-devops-agent-slack-threads}"
+# DDB_TABLE_NAME already set in step 5; reuse here for the throttle alarm.
 
 # AlarmActions intentionally unset: project has no SNS topic dedicated to
 # this stack. Alarms will fire to the CloudWatch console only — wiring an
@@ -296,9 +348,9 @@ aws cloudwatch put-metric-alarm \
 echo "    Alarm: ${LAMBDA_C_NAME}-ddb-throttle"
 
 # --------------------------------------------------------------------------
-# 9. Summary
+# 10. Summary
 # --------------------------------------------------------------------------
-echo "==> [9/9] Deployment complete."
+echo "==> [10/10] Deployment complete."
 cat <<EOF
 
   Account:        ${AWS_ACCOUNT_ID}

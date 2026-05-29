@@ -55,6 +55,14 @@ THREAD_TABLE_NAME = os.environ.get(
 # Threads expire after 7 days of inactivity
 THREAD_TTL_SECONDS = 7 * 24 * 3600
 
+# P0-4: Slack event_id idempotency. We share the threads table by writing
+# a separate row class with a `evt:` prefix on the partition key. The TTL
+# here only needs to outlive Slack's retry window (3x within ~3min) plus
+# any double-subscribe race (app_mention vs message.channels firing for
+# the same user message). 24h is comfortable margin.
+EVENT_IDEMPOTENCY_TTL_S = 24 * 3600
+EVENT_KEY_PREFIX = "evt:"
+
 # Placeholder written before create_chat returns. A concurrent request that
 # loses the conditional put will poll for this to flip to a real executionId.
 PENDING_EXECUTION_ID = "PENDING"
@@ -138,6 +146,47 @@ def _get_signing_secret() -> str:
         )
         _signing_secret = resp["SecretString"].strip()
     return _signing_secret
+
+
+# ----- Idempotency (DDB) -------------------------------------------------
+
+def _claim_event_idempotent(event_id: str) -> bool:
+    """Atomically claim a Slack event_id via conditional put on the threads
+    table (key prefixed with `evt:` so it can't collide with real thread_ts
+    values, which Slack always serializes as numeric strings like '1.0').
+
+    Returns:
+        True  -- first time we've seen this event_id; caller should proceed.
+        False -- duplicate; caller should ack 200 and drop.
+
+    Failure mode is fail-open: if DDB itself errors (throttle / network),
+    we log and return True. Re-processing a duplicate event is preferable
+    to silently dropping a first-arrival event because the idempotency
+    table was unreachable.
+    """
+    table = _get_thread_table()
+    now = int(time.time())
+    try:
+        table.put_item(
+            Item={
+                "thread_ts": f"{EVENT_KEY_PREFIX}{event_id}",
+                "event_id": event_id,
+                "processed_at": now,
+                "ttl": now + EVENT_IDEMPOTENCY_TTL_S,
+            },
+            ConditionExpression="attribute_not_exists(thread_ts)",
+        )
+        return True
+    except botocore.exceptions.ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code == "ConditionalCheckFailedException":
+            return False
+        logger.warning(json.dumps({
+            "msg": "idempotency_check_failed",
+            "event_id": event_id,
+            "error": str(e),
+        }))
+        return True  # fail-open
 
 
 # ----- Thread state (DDB) ------------------------------------------------
@@ -360,6 +409,21 @@ def _fast_path(event: dict, context) -> dict:
 
     # 3. Event callbacks
     if payload.get("type") == "event_callback":
+        # P0-4: Slack event_id-based idempotency. Slack guarantees event_id
+        # uniqueness, but the same user message can hit us twice when both
+        # `app_mention` and `message.channels` are subscribed (their event
+        # objects have different `event.ts` rounding but the same wrapper
+        # event_id). Without this, every @mention triggers TWO worker
+        # invocations -> 2x prompt cost. event_id absent (e.g. legacy
+        # fixtures, malformed payloads): skip the check rather than reject.
+        event_id = payload.get("event_id")
+        if event_id and not _claim_event_idempotent(event_id):
+            print(json.dumps({
+                "msg": "skipped_duplicate_event",
+                "event_id": event_id,
+            }))
+            return {"statusCode": 200, "body": "ack-duplicate"}
+
         inner = payload.get("event") or {}
         # Bots replying to themselves: ignore (defensive; subscription
         # uses bot events, not user events, but cover both)

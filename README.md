@@ -22,6 +22,39 @@ bash scripts/deploy-chatbot.sh   # optional: Slack chatbot for interactive chat
 
 ---
 
+## 0.0 为什么要做这个 bridge
+
+AWS DevOps Agent 自带原生 Slack 集成（[官方文档](https://docs.aws.amazon.com/devopsagent/latest/userguide/connecting-to-ticketing-and-chat-connecting-slack.html)），但只覆盖最基本的「调查完成 → 把结论推到一个 Slack 频道」这一种场景。落到生产 SRE 工作流里，原生集成有几个绕不过去的限制：
+
+*1. 只是单向通知，不支持 Slack 内对话*
+AWS 官方原文：「configure AWS DevOps Agent to update a Slack channel you select with incident response investigation key findings, root cause analyses, and generated mitigation plans」。换句话说，原生集成是 *agent → Slack* 的单向通道，*没有* Slack 内 `@mention` 追问、同 thread 多轮上下文、按需发起调查这些能力。值班人员在 Slack 里看到摘要后想追问「为什么不是 X 原因」「再查一下 Y 资源」，必须切到 AWS Console 的 chat 界面，节奏被打断。
+
+→ 本仓 *Lambda-C + DynamoDB thread 表* 解决：`@devops_agent <问题>` 在 Slack 直接调 `send_message` API，同 thread 内复用同一 `chat_id`，把 DevOps Agent 的对话能力暴露到 Slack 里。
+
+*2. 触发逻辑是黑盒，无法塞业务上下文*
+原生集成只能把 CloudWatch alarm（或 webhook）作为触发源，*Agent Space 自己决定如何把 alarm 翻译成 investigation backlog task*。当 alarm 来自非 EC2 namespace（EKS、自定义 metric、ContainerInsights），原生流程拿到的 description 经常缺关键 dimensions，导致 Agent 调查方向偏。
+
+→ 本仓 *Lambda-A* 解决：在我们自己的 Lambda 里把 *namespace + dimensions + alarm reason* 结构化拼进 `create_backlog_task` 的 description（顺手修了一个 EventBridge event 里 `accountId` / `region` 在 top-level 而不是 detail 里的取值 bug），保证调查从一开始就拿到完整上下文。
+
+*3. 输出格式不可控*
+原生 Slack 通知是固定模板，*没有* Block Kit 自定义、没有不同事件类型分别走不同 channel 的能力、不能把 `executionId` / journal 链接 / 关键 metric 抽成可点击元素。
+
+→ 本仓 *Lambda-B* 解决：监听 `aws.aidevops` 的 `Investigation Completed` 事件，自己拉 `list_journal_records → investigation_summary_md`，用 Slack Block Kit 自定义渲染（标题、严重度色块、journal 链接、相关资源 dimensions），可以按 alarm 类型路由到不同频道。
+
+*4. 区域 / 跨分区限制*
+DevOps Agent 服务本身只在少数 region 可用，且 AWS *中国区不支持*。如果应用部署在 aws-cn 或者 Agent Space 所在 region 与告警源 region 不同，原生集成无能为力。
+
+→ 本仓事件管道全部走 EventBridge + Lambda，可以无侵入地接入 [aws-devops-agent-cn-bridge](https://github.com/RadiumGu/aws-devops-agent-cn-bridge)（IAM Roles Anywhere 跨分区 assume），让 Global 分区的 Agent Space 调查 aws-cn 资源。
+
+*5. 部署不可代码化*
+原生 Slack 集成必须 *手动* 走「Console → Register → Slack OAuth → 选 workspace → Allow → 回 Console 关联 Agent Space」流程，每个频道都要手动加 bot 用户。无法纯 IaC 管理，多账号 / 多环境复制成本高。
+
+→ 本仓 `scripts/deploy.sh` + `scripts/deploy-chatbot.sh` 把除「创建 Slack App」之外的所有部署步骤脚本化（IAM、Lambda、EventBridge rule、API Gateway、DDB 表），`.env` 注入参数；Slack App 那一次性手动配置在 `docs/slack-setup.md` 里有详细 checklist。
+
+*一句话*：原生集成是 *demo 级* 的「调查完了通知一下」，本仓是 *生产级* 的「告警入口可控、调查上下文完整、Slack 内可对话、跨区可扩展」的 bridge 层。
+
+---
+
 ## 0. 架构总览
 
 ```
@@ -382,25 +415,13 @@ LAMBDA_C_NAME=devops-agent-slack-chatbot
 
 ```bash
 # 1. 创建 Slack App（手动一次）、拿 Bot Token + Signing Secret、存进 Secrets Manager（详见 docs/slack-setup.md）
-# 2. 创建 DDB 表
-Lambda-C 部署前必须先建表：
 
-aws dynamodb create-table --region "${AWS_REGION}" \
-  --table-name devops-agent-slack-threads \
-  --attribute-definitions AttributeName=thread_ts,AttributeType=S \
-  --key-schema AttributeName=thread_ts,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST
-aws dynamodb wait table-exists --region "${AWS_REGION}" --table-name devops-agent-slack-threads
-aws dynamodb update-time-to-live --region "${AWS_REGION}" \
-  --table-name devops-agent-slack-threads \
-  --time-to-live-specification "Enabled=true,AttributeName=ttl"
-
-# 3. 部署
+# 2. 部署（脚本会自动建 DDB 表 + 启用 TTL，幂等可重复执行）
 export ENV_FILE=.env
 ./scripts/deploy-chatbot.sh
 # 输出里会包含 API GW Invoke URL，用于下一步
 
-# 4. 在 Slack App 控制台配 Event Subscriptions（手动一次）：
+# 3. 在 Slack App 控制台配 Event Subscriptions（手动一次）：
 #    Request URL = 上一步 Invoke URL
 #    Subscribe to bot events: app_mention
 #    Save → Reinstall App

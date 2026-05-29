@@ -13,14 +13,15 @@ Environment variables:
                                 only; webhooks are pre-bound to a channel).
     AWS_REGION                - Auto-injected by Lambda runtime.
 
-Note on rotation: the webhook URL is cached at module import (cold start).
-After rotating the secret, the new value takes effect on the next cold
-start; warm containers continue using the old value until they cycle.
-For preview-period this is acceptable; rotate by triggering a Lambda config
-update (e.g. re-run deploy.sh) to force a refresh if needed.
+Note on rotation: the webhook URL is fetched lazily on first use and
+cached in-process for SECRET_CACHE_TTL_S seconds (default 1800 = 30 min).
+A rotation propagates to warm containers within that TTL without a
+redeploy. To force an immediate refresh you can still trigger a Lambda
+config update (re-run deploy.sh).
 """
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 import boto3
@@ -32,15 +33,31 @@ REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 # Slack mrkdwn block size limit is 3000 chars per text block; leave margin
 SLACK_BLOCK_LIMIT = 2900
 
+# Lazy-load secret. P0-2 fix: previously this module called
+# get_secret_value() at import time, which made cold-starts brittle
+# (Secrets Manager throttling / IAM propagation lag would crash init and
+# bounce the EventBridge event toward the DLQ after 2 retries). We now
+# fetch on first invocation and cache for SECRET_CACHE_TTL_S to also pick
+# up rotations without a redeploy.
+SECRET_CACHE_TTL_S = int(os.environ.get("SECRET_CACHE_TTL_S", "1800"))
+
 _client = boto3.client("devops-agent", region_name=REGION)
 _secrets_client = boto3.client("secretsmanager", region_name=REGION)
 
-# Cached at cold start. Raises on failure so the invocation hits the DLQ
-# instead of silently using a stale value (there is no stale value yet —
-# but be explicit: never fallback to env-var plaintext).
-_webhook_url: str = _secrets_client.get_secret_value(
-    SecretId=SLACK_WEBHOOK_SECRET_ARN,
-)["SecretString"].strip()
+_webhook_url_cache: dict = {"value": None, "expires_at": 0.0}
+
+
+def _get_webhook_url() -> str:
+    """Return the Slack Incoming Webhook URL, fetching from Secrets Manager
+    on first call and refreshing every SECRET_CACHE_TTL_S seconds."""
+    now = time.time()
+    if _webhook_url_cache["value"] and now < _webhook_url_cache["expires_at"]:
+        return _webhook_url_cache["value"]
+    resp = _secrets_client.get_secret_value(SecretId=SLACK_WEBHOOK_SECRET_ARN)
+    url = resp["SecretString"].strip()
+    _webhook_url_cache["value"] = url
+    _webhook_url_cache["expires_at"] = now + SECRET_CACHE_TTL_S
+    return url
 
 
 def get_investigation_summary(agent_space_id: str, execution_id: str) -> str:
@@ -190,7 +207,7 @@ def post_to_slack(blocks: list[dict], fallback_text: str) -> None:
         payload["channel"] = SLACK_CHANNEL
 
     req = urllib.request.Request(
-        _webhook_url,
+        _get_webhook_url(),
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
