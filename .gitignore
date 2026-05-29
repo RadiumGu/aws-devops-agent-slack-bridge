@@ -22,3 +22,4 @@ iam/backups/
 .idea/
 .DS_Store
 *.swp
+.review/
