@@ -1,24 +1,43 @@
-# AWS DevOps Agent — 部署文档
+# AWS DevOps Agent ↔ Slack Bridge
 
-> **Related**：[aws-devops-agent-cn-bridge](https://github.com/RadiumGu/aws-devops-agent-cn-bridge) — 让 Global 分区的 DevOps Agent 能访问 aws-cn 资源的跨分区桥接（CFN + IAM Roles Anywhere）。
+> 🌐 *Languages*: 中文（当前）· [English](README.en.md)
+>
+> *Related*: [aws-devops-agent-cn-bridge](https://github.com/RadiumGu/aws-devops-agent-cn-bridge) — 让 Global 分区的 DevOps Agent 能访问 aws-cn 资源的跨分区桥接（CFN + IAM Roles Anywhere）。
 
-> **目标账号**：`<ACCOUNT_ID>`（你自己的 12 位 AWS 账号）
-> **Region**：`<region>`（PetSite 实测在 `ap-northeast-1`）
-> **Agent Space**：`<agent-space-name>` (`<AGENT_SPACE_UUID>`)
-> **通知渠道**：Slack 频道 `<SLACK_CHANNEL_ID>` + Incoming Webhook
-> **状态**：✅ 已端到端验证通过（FIS 删 2 个 EKS node → DevOps Agent 自动调查 → Slack 推摘要）
+## 它是什么
 
-> 本仓里所有 `<UPPERCASE_PLACEHOLDER>` 都靠 `.env` 注入，文件不入库。具体每个变量的取值方式见 [§2.5 Configuration](#25-configuration-env)。
+一个轻量级 *bridge 层*，把 [AWS DevOps Agent](https://aws.amazon.com/blogs/aws/aws-devops-agent-helps-you-accelerate-incident-response-and-improve-system-reliability-preview/)（预览期）与 Slack 双向打通：
+
+- *告警 → 调查 → 推 Slack* 的全自动 SRE 主线（CloudWatch Alarm → Lambda → DevOps Agent → Slack Block Kit 摘要）
+- *Slack 内多轮对话*：`@devops_agent <问题>` 调起调查，同 thread 内复用同一 chat session，后续追问免 @
+
+原生集成只能「完了推一下」是单向的，本仓补齐其余纬度（详见 [§0.0 为什么要做这个 bridge](#00-为什么要做这个-bridge)）。
+
+## 主要特性
+
+- 🔌 *告警入口可控* — Lambda-A 把任意 namespace 的 CloudWatch alarm（EKS / RDS / Lambda / 自定义 metric / ContainerInsights…）结构化拼进 investigation description，不假设只是 EC2
+- 🔄 *EventBridge 事件幂等* — 同一 alarm 不会被重复立案调查（DDB 原子 claim by `alarmName + state.timestamp`）
+- 💬 *Slack 主动调起 · thread 多轮* — Lambda-C 接 Slack Events API，fast-path 3s ack + Lambda 自异步调 worker；DDB 记录 thread_ts → chat_id 映射，同 thread 内免 @续问
+- 🛡️ *Slack 签名验证 + 5min replay 防御 + event_id 幂等* — 双订阅（`app_mention` + `message.channels`）不会双发 prompt
+- 🌍 *跨分区可扩展* — 事件管道全走 EventBridge + Lambda，可以叠加 cn-bridge 让 Global 区 Agent 调查 aws-cn 资源
+- 📦 *一键脚本部署* — IAM / Lambda / EventBridge / API Gateway / DDB / DLQ / CloudWatch alarm 全脚本化，幂等可重复执行；Slack App 创建这一步手动一次在 `docs/slack-setup.md`
+- 🔁 *可快速适配飞书* — chat 层抽象都在 Lambda-C 里（签名验证、Block Kit 渲染、`@mention` 剖析、`chat.update` 占位子），换成飞书只需重写 `slack_verify.py`、Block Kit → 飞书 card / interactive message、webhook URL 格式。Lambda-A/B/EventBridge 主线零修改。
 
 ## Quick Start
 
 ```bash
-git clone <repo-url> && cd devops-agent
+git clone <repo-url> && cd aws-devops-agent-slack-bridge
 cp .env.example .env
 # edit .env with your account/region/Slack/Agent Space values
 bash scripts/deploy.sh           # main alarm → investigation → Slack pipeline
 bash scripts/deploy-chatbot.sh   # optional: Slack chatbot for interactive chat
 ```
+
+最低需要填的 ·env·：`AWS_ACCOUNT_ID` / `AWS_REGION` / `DEVOPS_AGENT_SPACE_ID` / `SLACK_WEBHOOK_URL` / `SLACK_TEST_CHANNEL`。详见 [§2.5 Configuration](#25-configuration-env)。
+
+> *状态*: ✅ 已端到端验证通过（FIS 删 2 个 EKS node → DevOps Agent 自动调查 → Slack 推摘要 + thread 多轮对话）。
+>
+> 本仓里所有 `<UPPERCASE_PLACEHOLDER>` 都靠 `.env` 注入，文件不入库。
 
 ---
 
@@ -434,38 +453,71 @@ export ENV_FILE=.env
 @devops_agent ping                                  # 得到 "Hey there!" 之类
 @devops_agent list EC2 instances in <region>        # 得到 EC2 列表
 # 同 thread 追问（点上一条的 “Reply in thread”）：
-which one is biggest?                                # 已开 thread 内可免 @ 直接对话（见下方 P1-18）
+which one is biggest?                                # thread 内免 @（见§5.6 Slack 使用说明）
 ```
 
-#### P1-18：thread 内免 @mention 续问（2026-05-21 起）
-
-每次都打 `@devops_agent` 太啰嗦。从 P1-18 开始：*只要 thread 已被 bot 回过（DDB 命中 thread_ts 记录）*，同 thread 内的 `message.channels` event 也会被 chatbot 接住，无需再 @。
-
-启用步骤（一次性）：
-
-1. Slack App Console → **OAuth & Permissions** → 给 Bot 加 `channels:history` scope（读取频道消息历史，仅在已 invite 的频道生效）
-2. **Event Subscriptions** → *Subscribe to bot events* → 加 `message.channels`
-3. 顶部黄条 *Reinstall App*
-
-设计要点：
-
-- 进 Lambda-C 的 *所有* `message.channels` event 先查 DDB（thread_ts → executionId）；*没命中就直接丢*，不走 send_message。这是为什么 noise 不会爆量
-- 防 bot 自言自语：`event.user == bot_user_id` 直接 skip
-- 收到陌生 thread 消息（DDB 没记录）→ 计数到 CloudWatch metric `DevOpsAgent/SlackChatbot/UnhandledMessageEvents`，可在 Dashboard 看 noise 量；持续 > 10/min 表示要么 scope 太宽要么 DDB TTL 过期了
-
-*考获与设计要点*：
-
-- *Slack 3 秒响应规则* — fast path 必须在 3s 内 200 ack。实现为同一 Lambda 自异步调用（`InvocationType=Event`）走 worker 路径，实测 fast path *热启动 ~258ms / 冷启动 ~1019ms*
-- *多轮对话* — thread_ts 作为 DDB PK。同 thread 复用同一 `executionId`。并发顶双 mention 靠 *DDB conditional put* 避免重复 create_chat
-- *安全* — Slack signing 验签（v0:timestamp:body HMAC-SHA256）+ 5-min replay protection + `hmac.compare_digest`
-- *去重* — Slack 重试（`X-Slack-Retry-Num`）直接返 200 不二次调 chat
-- *TTL* — thread 表 7 天后自动过期，超过一周没人提的 thread 下次会重启会话
-
-*未取 webhook 路线*：不复用 Lambda-B 的 Incoming Webhook，因为 webhook *不能接收 events*，只能单向发 —— 双向必须上 Bot Token。这也是为什么新建了 Slack App `PetSite DevOps Agent`。
-
-*单元测试*：tests/test_slack_verify.py 覆盖 12 个场景（正常签名 / 大写 header / 过期时间戳 / 未来时间戳 / 篡改 body / 错 secret / 缺 header / 空 secret / 非 bytes body / timing-safe 比对 等）。
+详细使用说明、Slack App 配置、多 topic 场景、设计要点都集中在 [§5.6 Slack 使用说明](#56-slack-使用说明·配置--交互行为) 里。
 
 ---
+
+### 5.6 Slack 使用说明 · 配置 + 交互行为
+
+**Slack App 一次性配置**（详细步骤在 `docs/slack-setup.md`）：
+
+| 步骤 | 在哪做 | 做什么 |
+|---|---|---|
+| 1 | https://api.slack.com/apps → Create | 新建 App，名字随意（如 `PetSite DevOps Agent`） |
+| 2 | OAuth & Permissions → Bot Token Scopes | 加 `app_mentions:read`、`chat:write`、`channels:history`、`groups:history`（私有频道时） |
+| 3 | Event Subscriptions → Enable | Request URL 填 `deploy-chatbot.sh` 输出的 API GW URL；订阅 bot events: `app_mention` + `message.channels` |
+| 4 | Install to Workspace | 拿到 Bot Token (`xoxb-...`) + Signing Secret，存进 Secrets Manager（脚本用） |
+| 5 | 频道里 `/invite @devops_agent` | 把 bot 加进所有需要的频道（私有频道必须，公共频道也建议）|
+
+**正常使用方式**：
+
+| 场景 | 怎么发 | bot 行为 |
+|---|---|---|
+| *新问题（顶层）* | `@devops_agent <问题>` 在频道顶层发 | bot 创建新 chat session，回复以 thread 形式开启 |
+| *同 thread 追问* | 直接在 thread 里发消息（**不用 @**） | bot 复用这个 thread 已有的 chat session（DDB hit），保留多轮上下文 |
+| *老 thread 重新激活* | 7 天内同 thread 继续发 | bot 仍复用原 chat（DDB TTL 7 天） |
+| *老 thread > 7 天* | 同 thread 发消息 | DDB 已过期 → 当作新问题处理（不可避免 |
+| *新 topic（新 thread）* | 必须 `@devops_agent <问题>` 重新顶层发 | bot 开新 chat session，与之前 thread 隔离 |
+| *老 channel 内不相关闲聊* | 不要 @ bot | bot 不响应（`message.channels` 命中后查 DDB，没记录就丢；EMF metric `UnhandledMessageEvents` 计数）|
+
+⚠️ *注意点*：
+
+- *不要在私有频道直接 mention*，必须先 `/invite @devops_agent` 加进去
+- *不要把 bot 加进 #general 这种高噪声频道* —— 即使 message.channels 会 DDB 过滤掉 noise，也会消耗 Lambda invocation
+- *thread 内多轮对话期间，每条新消息消耗 1 次 Lambda 调用*（fast-path ack + worker 异步），reserved concurrency 上限 5（脚本默认）
+- *bot 只看 thread_ts 不看用户身份*：所以同 thread 内任何人发消息 bot 都会响应（设计上是为了协作场景；如果不想这样要在 worker 里加 user 白名单）
+
+**架构**：
+
+```
+Slack @mention → Slack Events API → API Gateway HTTP API → Lambda-C
+                                                              │ (fast path: ack 200 in <3s)
+                                                              ├→ event_id 幂等 check（DDB evt: 前缀）
+                                                              ├→ lambda.invoke(self, _internal=chat) 异步自调用
+                                                              │
+                                                              └→ (worker path)
+                                                                  1. DDB get_item(thread_ts) 查/建 chat
+                                                                  2. devops-agent.send_message
+                                                                  3. Slack chat.postMessage 占位 + chat.update 替换
+```
+
+**关键设计点**：
+
+- *Slack 3 秒响应规则* — fast path 必须在 3s 内 200 ack。同 Lambda 自异步调用（`InvocationType=Event`）走 worker；fast path 实测 *热启动 ~258ms / 冷启动 ~1019ms*
+- *多轮对话* — `thread_ts` 作为 DDB PK，同 thread 复用同一 `executionId`（chat session）
+- *双订阅幂等* — `app_mention` + `message.channels` 同一 user message 会触发两次 event，DDB `evt:` 前缀的 ConditionalCheck 原子去重
+- *安全* — Slack signing 验签（v0:timestamp:body HMAC-SHA256）+ 5min replay protection + `hmac.compare_digest` 时序安全比较
+- *TTL* — thread 表 7 天后自动过期；超过一周没人提的 thread 下次会重启会话
+
+**为什么没用 Incoming Webhook**：webhook 只能单向发，不能接 Slack events，双向必须 Bot Token。Lambda-B（推 Slack 摘要）走 webhook 即可；Lambda-C（多轮交互）必须走 Bot Token + chat.postMessage / chat.update。
+
+**单元测试覆盖**：`tests/test_slack_verify.py` 12 个场景（正常签名 / 大写 header / 过期时间戳 / 未来时间戳 / 篡改 body / 错 secret / 缺 header / 空 secret / 非 bytes body / timing-safe 比对 等）；`tests/test_lambda_c.py` 25 个场景（fast/worker path、event 幂等、thread reply 自动响应、race-loser LWW 等）。
+
+---
+
 
 ## 6. 端到端验证（FIS 实战）
 

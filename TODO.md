@@ -130,12 +130,7 @@
 
 ### Lambda-C UX 改进
 
-- [x] **P1-18 thread 内免 @ 自动响应**（完成 2026-05-21，#C0AJQ1TELTY 实测通过）
-  - Slack App Console 加订阅 `message.channels` + `channels:history` scope（大乖乖 2026-05-21 14:22 完成）
-  - Lambda-C 加 `_is_thread_reply_for_us`：subtype 空 + thread_ts ≠ ts + DDB hit + execution_id ≠ PENDING
-  - DDB 报错 fail-closed（不响应不相关频道）；EMF metric `DevOpsAgent/SlackChatbot/UnhandledMessageEvents` 计数 drop
-  - `tests/test_lambda_c.py::ThreadReplyAutoRespondTests` 8 测试，全套 71 passed
-  - 2026-05-21 14:30 大乖乖 #C0AJQ1TELTY 实测通过
+- [x] **P1-18 thread 内免 @ 自动响应**（完成 2026-05-21）
 
 ---
 
@@ -149,6 +144,35 @@
 - [x] **P2-19 Slack 输入长度截断**（完成 2026-05-20）
   - `lambda/lambda_c/lambda_function.py`：`MAX_USER_PROMPT_CHARS = 4000` + `PROMPT_TOO_LONG_TEMPLATE`；`_worker_path` 在 `text.strip()` 后立即检查，超长直接 post warning + return `prompt-too-long`
   - 单测：≤ limit 走原路径；> limit 收到 `:warning: Your prompt is too long` 文案，且 `_get_or_create_chat` 未被调用
+
+### 飞书适配（Lark）
+
+- [ ] **P2-FS1 抽象 chat 平台层**
+  - 状态：未开始
+  - 目标：让 Lambda-C 的核心逻辑（thread 状态机、event_id 幂等、prompt 长度校验、chat session 管理）与 Slack 解耦
+  - 范围：定义 `ChatAdapter` 接口（`verify_signature`、`parse_event`、`post_message`、`update_message`、`render_summary_blocks`），把 Slack 实现独立成 `chat_adapter_slack.py`
+  - 收益：飞书适配只需新增一个 `chat_adapter_lark.py`，主流程零改动
+
+- [ ] **P2-FS2 飞书 chatbot adapter 实现**
+  - 状态：未开始
+  - 范围：
+    - 飞书机器人验签（X-Lark-Signature + body）
+    - 飞书 event subscription URL_VERIFICATION challenge
+    - `@_user_<open_id>` mention 解析（飞书的 mention 格式与 Slack 不同）
+    - 飞书富文本 / 卡片消息渲染（替代 Slack Block Kit）
+    - thread 概念映射：飞书的「话题/话题回复」≈ Slack thread；用 `chat_id + root_message_id` 当 thread_ts
+  - 飞书侧配置 checklist（Lark Open Platform → 自建应用 → 事件订阅 + 权限：`im:message`、`im:message.group_at_msg`、`im:message:send_as_bot`）
+
+- [ ] **P2-FS3 多平台路由**
+  - 状态：未开始
+  - 目标：单 Lambda-C 同时处理 Slack 和飞书（按 API GW 路径区分 `/slack/events` vs `/lark/events`）
+  - 或：拆双 Lambda（Lambda-C-slack / Lambda-C-lark）共享 thread state DDB 表（PK 加 `slack:` / `lark:` 前缀）
+
+- [ ] **P2-FS4 Lambda-B 推送通道扩展**
+  - 状态：未开始
+  - 把 investigation summary 同时推 Slack（已实现）+ 飞书群（新增），按 alarm 严重度路由
+
+---
 
 ### IaC + 治理
 
